@@ -1,0 +1,233 @@
+# -*- coding: utf-8 -*-
+"""
+OutputValidator — проверка физической корректности результатов на ВСЁМ
+горизонте.
+
+Зачем: организаторы прямо указали, что физически некорректные значения в
+выходных файлах расцениваются как баг и грозят дисквалификацией. Проверка
+идёт по каждому шагу и каждой скважине, а не по итоговым суммам.
+
+Запускается ВНУТРИ контейнера (нужен resdata):
+
+    python3 validate_output.py /out/MODEL_Y.SMSPEC
+    python3 validate_output.py /out/MODEL_Y.SMSPEC --json /out/validation.json
+
+Код возврата: 0 — чисто, 1 — есть нарушения.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from dataclasses import dataclass, asdict, field
+
+# --- пределы. Источники: методика ЧДД и дека Model_Y --------------------
+MAX_LIQUID_RATE = 500.0     # м3/сут — выше методика ЧДД не считает
+MIN_BHP_PROD = 50.0         # бар — техминимум добывающих (из WCONPROD)
+MAX_BHP_INJ = 300.0         # бар — предел нагнетательных (из WCONINJE)
+MAX_PRESSURE = 500.0        # бар — здравый смысл для пластового
+MIN_PRESSURE = 1.0
+TOL = 1e-6                  # допуск на численный шум
+
+
+@dataclass
+class Issue:
+    severity: str           # "error" | "warning"
+    check: str
+    well: str
+    date: str
+    value: float
+    limit: float
+    message: str
+
+
+@dataclass
+class Report:
+    total_steps: int = 0
+    total_wells: int = 0
+    period: str = ""
+    errors: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+    checks_run: list = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def validate(smspec: str, max_report: int = 8) -> Report:
+    from resdata.summary import Summary
+
+    s = Summary(smspec)
+    keys = set(s.keys())
+    dates = [d.date() if hasattr(d, "date") else d for d in s.dates]
+
+    wells = sorted({k.split(":", 1)[1] for k in keys if ":" in k
+                    and any(f"{m}:{k.split(':',1)[1]}" in keys
+                            for m in ("WOPR", "WLPR", "WWIR"))})
+
+    rep = Report(total_steps=len(dates), total_wells=len(wells),
+                 period=f"{dates[0]} .. {dates[-1]}" if dates else "")
+
+    def vec(name: str, w: str):
+        k = f"{name}:{w}"
+        return list(s.numpy_vector(k)) if k in keys else None
+
+    def err(check, well, i, val, lim, msg):
+        rep.errors.append(asdict(Issue("error", check, well,
+                                       dates[i].isoformat(), val, lim, msg)))
+
+    def warn(check, well, i, val, lim, msg):
+        rep.warnings.append(asdict(Issue("warning", check, well,
+                                         dates[i].isoformat(), val, lim, msg)))
+
+    # ------------------------------------------------------------------
+    rep.checks_run.append("дебит жидкости <= 500 м3/сут")
+    rep.checks_run.append("забойное добывающих >= 50 бар")
+    rep.checks_run.append("забойное нагнетательных <= 300 бар")
+    rep.checks_run.append("обводнённость в [0, 1]")
+    rep.checks_run.append("накопленные не убывают")
+    rep.checks_run.append("дебиты не отрицательны")
+    rep.checks_run.append("нет NaN и бесконечностей")
+    rep.checks_run.append("жидкость = нефть + вода")
+
+    for w in wells:
+        wlpr, wopr, wwpr = vec("WLPR", w), vec("WOPR", w), vec("WWPR", w)
+        wwir, wbhp, wwct = vec("WWIR", w), vec("WBHP", w), vec("WWCT", w)
+        wopt, wwpt, wwit = vec("WOPT", w), vec("WWPT", w), vec("WWIT", w)
+        is_inj = wwir is not None and max(wwir, default=0) > 0.01
+
+        # --- NaN и бесконечности --------------------------------------
+        for name, v in (("WLPR", wlpr), ("WOPR", wopr), ("WBHP", wbhp)):
+            if v is None:
+                continue
+            for i, x in enumerate(v):
+                if math.isnan(x) or math.isinf(x):
+                    err("nan_inf", w, i, 0.0, 0.0,
+                        f"{name} = {x} — численный сбой решателя")
+                    break
+
+        # --- потолок по жидкости --------------------------------------
+        if wlpr:
+            for i, x in enumerate(wlpr):
+                if x > MAX_LIQUID_RATE + TOL:
+                    err("max_liquid", w, i, x, MAX_LIQUID_RATE,
+                        f"дебит жидкости {x:.1f} > {MAX_LIQUID_RATE:.0f} — "
+                        f"методика ЧДД такое не считает")
+                if x < -TOL:
+                    err("negative_rate", w, i, x, 0.0,
+                        f"отрицательный дебит жидкости {x:.3f}")
+
+        if wopr:
+            for i, x in enumerate(wopr):
+                if x < -TOL:
+                    err("negative_rate", w, i, x, 0.0,
+                        f"отрицательный дебит нефти {x:.3f}")
+
+        # --- забойное давление ----------------------------------------
+        if wbhp:
+            for i, x in enumerate(wbhp):
+                active = (wwir[i] > 0.01 if is_inj and wwir
+                          else (wlpr[i] > 0.01 if wlpr else False))
+                if not active:
+                    continue          # закрытая скважина: BHP не показатель
+                if is_inj and x > MAX_BHP_INJ + TOL:
+                    err("max_bhp_inj", w, i, x, MAX_BHP_INJ,
+                        f"забойное нагнетательной {x:.1f} > {MAX_BHP_INJ:.0f} бар "
+                        f"— риск разрыва пласта")
+                if not is_inj and 0 < x < MIN_BHP_PROD - TOL:
+                    err("min_bhp_prod", w, i, x, MIN_BHP_PROD,
+                        f"забойное добывающей {x:.1f} < {MIN_BHP_PROD:.0f} бар "
+                        f"— ниже техминимума")
+                if x > MAX_PRESSURE or (0 < x < MIN_PRESSURE):
+                    warn("pressure_range", w, i, x, MAX_PRESSURE,
+                         f"давление {x:.1f} вне разумного диапазона")
+
+        # --- обводнённость --------------------------------------------
+        if wwct:
+            for i, x in enumerate(wwct):
+                if x < -TOL or x > 1.0 + TOL:
+                    err("watercut_range", w, i, x, 1.0,
+                        f"обводнённость {x:.4f} вне [0, 1]")
+
+        # --- баланс: жидкость = нефть + вода ---------------------------
+        if wlpr and wopr and wwpr:
+            for i in range(len(wlpr)):
+                total = wopr[i] + wwpr[i]
+                if wlpr[i] > 1.0 and abs(total - wlpr[i]) / wlpr[i] > 0.02:
+                    warn("phase_balance", w, i, wlpr[i], total,
+                         f"жидкость {wlpr[i]:.2f} != нефть+вода {total:.2f}")
+                    break
+
+        # --- накопленные не убывают -----------------------------------
+        for name, v in (("WOPT", wopt), ("WWPT", wwpt), ("WWIT", wwit)):
+            if not v:
+                continue
+            for i in range(1, len(v)):
+                if v[i] < v[i - 1] - max(TOL, abs(v[i - 1]) * 1e-9):
+                    err("cumulative_drop", w, i, v[i], v[i - 1],
+                        f"{name} убыла: {v[i-1]:.2f} -> {v[i]:.2f} — "
+                        f"технический сброс счётчика или сбой")
+                    break
+
+    # --- поле в целом --------------------------------------------------
+    if "FPR" in keys:
+        fpr = list(s.numpy_vector("FPR"))
+        for i, x in enumerate(fpr):
+            if math.isnan(x) or x < MIN_PRESSURE or x > MAX_PRESSURE:
+                err("field_pressure", "FIELD", i, x, MAX_PRESSURE,
+                    f"пластовое давление {x:.1f} вне диапазона")
+                break
+
+    return rep
+
+
+def print_report(rep: Report, max_show: int = 8) -> None:
+    print(f"проверено: {rep.total_wells} скважин x {rep.total_steps} шагов")
+    print(f"период: {rep.period}")
+    print(f"проверок: {len(rep.checks_run)}")
+
+    if rep.errors:
+        print(f"\n  ОШИБОК: {len(rep.errors)}")
+        by_check: dict[str, int] = {}
+        for e in rep.errors:
+            by_check[e["check"]] = by_check.get(e["check"], 0) + 1
+        for c, n in sorted(by_check.items(), key=lambda x: -x[1]):
+            print(f"    {c}: {n}")
+        print("\n  первые нарушения:")
+        for e in rep.errors[:max_show]:
+            print(f"    {e['well']:>5} {e['date']}: {e['message']}")
+
+    if rep.warnings:
+        print(f"\n  предупреждений: {len(rep.warnings)}")
+        for wn in rep.warnings[:4]:
+            print(f"    {wn['well']:>5} {wn['date']}: {wn['message']}")
+
+    print()
+    if rep.ok:
+        print("  РЕЗУЛЬТАТ ФИЗИЧЕСКИ КОРРЕКТЕН")
+    else:
+        print("  ЕСТЬ НАРУШЕНИЯ — сдавать нельзя")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="проверка физики результата")
+    p.add_argument("smspec")
+    p.add_argument("--json", help="сохранить отчёт")
+    p.add_argument("--max-show", type=int, default=8)
+    a = p.parse_args()
+
+    rep = validate(a.smspec)
+    print_report(rep, a.max_show)
+
+    if a.json:
+        with open(a.json, "w", encoding="utf-8") as f:
+            json.dump(asdict(rep), f, ensure_ascii=False, indent=2)
+        print(f"\nотчёт: {a.json}")
+
+    sys.exit(0 if rep.ok else 1)
+
+
+if __name__ == "__main__":
+    main()

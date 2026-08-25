@@ -1,0 +1,7 @@
+# Дека пришла из Windows с CRLF. В репозитории держим LF, чтобы diff
+# показывал реальные изменения, а не невидимые символы.
+* text=auto eol=lf
+*.DATA text eol=lf
+*.inc  text eol=lf
+*.sh   text eol=lf
+*.py   text eol=lf
