@@ -1,93 +1,195 @@
-# Big Data Fish
+# AIOS · Трек 1 — мультиагентная система управления фондом скважин
 
+Система подбирает расписание управляющих воздействий на 49 скважинах так,
+чтобы максимизировать ЧДД на горизонте 2014–2022 при соблюдении
+технологических ограничений.
 
+**Опорное значение (ничего не делаем): 2 497,1 млн руб.**
+Всё, что делает система, меряется относительно этой планки.
 
-## Getting started
+---
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Быстрый старт
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+```bash
+cd ~/aios/scripts
 
-## Add your files
+./setup_dirs.sh          # структура каталогов и проверка окружения
+./smoke_test.sh          # проверка контура на эталонной модели SPE1
+./benchmark.sh           # замер: время прогона, параллельность, место
+./prepare_history.sh     # история 2007 -> 01.01.2014: снимок + датасет
+./prepare_baseline.sh    # опорный сценарий 2014-2022 -> планка ЧДД
+```
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+Требуется Docker с образом `aios/opm:2026.04` — сборка описана в
+`scripts/INSTALL.md`.
+
+---
+
+## Структура
 
 ```
-cd existing_repo
-git remote add origin https://hackathon-aios.gitlab.yandexcloud.net/ans_kaz/big-data-fish.git
-git branch -M main
-git push -uf origin main
+aios/
+├── vendor/              ЭТАЛОН ОРГАНИЗАТОРОВ — не править
+│   ├── model/Model_Y/   дека как выдали
+│   ├── chdd/            CHDD_PYTHON: официальный расчёт ЧДД
+│   └── docs/            ТЗ, методика, регламент, лекции
+│
+├── model/               РАБОЧИЕ КОПИИ ДЕКИ
+│   ├── Model_Y_opm/     адаптирована под OPM Flow
+│   ├── Model_Y_hist/    обрезана на 01.01.2014 (история)
+│   ├── Model_Y_base/    опорный сценарий (режимы заморожены)
+│   └── CHANGES_FOR_OPM.md   ★ журнал правок деки
+│
+├── scripts/             ОБВЯЗКА ВОКРУГ СИМУЛЯТОРА
+├── src/aios/            КОД СИСТЕМЫ
+│   ├── core/            чистая логика: ЧДД, ограничения, ЭЦН, диагностика
+│   ├── interference/    матрица связей между скважинами
+│   ├── adapters/        симулятор, LLM, пул процессов
+│   ├── agents/          LLM-слой, только структурированный вывод
+│   ├── optimize/        дискретная сетка, Candidate Packer
+│   └── orchestrator/    цикл, журнал решений
+│
+├── configs/             ограничения, экономика, параметры цикла
+├── ui/                  дашборд: кривая ЧДД, Ганта, карта скважин
+├── tests/               в т.ч. тест на круг для wells_schedule.inc
+├── docs/                архитектура, ADR, трактовки методики
+└── submission/          ★ что уходит организаторам
+
+~/aios-data/             ВНЕ РЕПОЗИТОРИЯ, гигабайты
+├── runs/history/        прогон истории: снимок 2014 + датасет
+├── runs/baseline/       опорный сценарий
+├── runs/candidates/     пробные прогоны (чистятся)
+├── probes/              возмущающие прогоны для матрицы влияния
+├── cache/               хеш деки -> результат
+└── logs/                disk_stop.log, mem_stop.log, batch_*.log
 ```
 
-## Integrate with your tools
+---
 
-* [Set up project integrations](https://hackathon-aios.gitlab.yandexcloud.net/ans_kaz/big-data-fish/-/settings/integrations)
+## Скрипты
 
-## Collaborate with your team
+Все пути заданы в `lib_common.sh` — единственном месте, где они есть.
+Любую переменную можно переопределить: `MODEL_DIR=/путь ./benchmark.sh`.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+| Скрипт | Что делает | Когда запускать |
+|---|---|---|
+| `setup_dirs.sh` | создаёт структуру, проверяет права, место, образ | при разворачивании и при странностях |
+| `smoke_test.sh` | прогон SPE1, чтение сводок | после сборки образа |
+| `benchmark.sh` | время прогона, оптимум параллельности, место | один раз на новой машине |
+| `prepare_history.sh` | история до отсечки → снимок + датасет | один раз |
+| `prepare_baseline.sh` | режимы заморожены, прогон вперёд → планка | один раз, при смене горизонта |
+| `probe_wells.py make` | генерирует 99 дек возмущений | перед построением матрицы |
+| `run_probes.sh` | прогоняет возмущения (~46 мин) | после `make` |
+| `analyze_probes.sh` | собирает матрицу откликов | после прогонов |
+| `run_batch.sh` | пакетные прогоны со стражами | оптимизационные кампании |
+| `summary_to_csv.py` | UNSMRY → 14 колонок для расчёта ЧДД | внутри других скриптов |
+| `npv_official.py` | ★ ЧДД по эталону организаторов | везде, где нужны деньги |
+| `cleanup.sh` | уборка и архивация | когда кончается место |
 
-## Test and Deploy
+### Примеры
 
-Use the built-in continuous integration in GitLab.
+```bash
+# опорный сценарий с другим горизонтом
+./prepare_baseline.sh 2014-01-01 2030
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+# матрица влияния целиком
+python3 probe_wells.py make --cut 2014-01-01 --months 36
+./run_probes.sh
+./analyze_probes.sh                # пороги: 2% относительный, 0.3 м3/сут абсолютный
+./analyze_probes.sh 0.01 0.1       # чувствительнее, больше шума
 
-***
+# деление работы между машинами
+./run_probes.sh 1 50               # первая
+./run_probes.sh 51 99              # вторая
 
-# Editing this README
+./run_batch.sh 500 6               # 500 прогонов, 6 параллельно
+./run_batch.sh 500 6 501           # вторая машина, нумерация с 501
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+# ЧДД любого прогона
+python3 npv_official.py ~/aios-data/runs/baseline/chdd_input.csv
 
-## Suggestions for a good README
+# уборка
+./cleanup.sh                       # пробные прогоны
+./cleanup.sh --snapshots           # только тяжёлые UNRST
+ARCHIVE_DIR=/mnt/d/archive ./cleanup.sh --archive
+```
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+---
 
-## Name
-Choose a self-explaining name for your project.
+## Что важно знать
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+### Расчёт ЧДД — только эталонный
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+`vendor/chdd/chdd_model.py` — код организаторов, единственный источник
+правды по деньгам. `npv_official.py` — тонкая обёртка над ним, своей
+арифметики не содержит. Вторая реализация формулы означала бы расхождение
+при контрольном пересчёте, а попытка одна.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+Сверено на примере организаторов: 52,055 млн — совпадает до третьего знака.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+### Единицы измерения
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+OPM Flow **не поддерживает** `WOMT`/`WOMR` — это ключевые слова
+tNavigator. Масса нефти считается из объёма: `WOPT × 0.833` т/м³
+(из `DENSITY` в `pvt.inc`: 832 и 834 кг/м³ по двум PVT-регионам).
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+`THP`, `BHP`, `WEFF` в формулы ЧДД не входят — проверено по коду эталона,
+используются только для средних в отчёте.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+### Место на диске
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+Один прогон без снимков — 25 МБ, из них 22 МБ статика (`EGRID`, `INIT`),
+одинаковая во всех прогонах. Со снимками (`RPTRST`) — до 1,3 ГБ.
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+Все скрипты отключают `RPTRST` для пробных прогонов автоматически.
+Страж останавливает работу при 30 ГБ свободного места и пишет отчёт.
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+**Важно:** внутри WSL `df` показывает размер виртуального диска (~1 ТБ),
+но VHDX физически лежит на диске C. Скрипты берут минимум из двух.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+### Память
 
-## License
-For open source projects, say how it is licensed.
+Замерено 0,92 ГБ на процесс. Параллельность подбирается автоматически
+по свободной памяти и числу ядер (два потока на процесс). Контейнер
+ограничен `--memory`, чтобы при нехватке ядро убило его, а не начало
+свопить систему.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+### Правки деки
+
+Дека от организаторов сделана в tNavigator и без правок не читается
+OPM Flow. Все изменения — в `model/CHANGES_FOR_OPM.md`. Каждая строка
+там — потенциальный источник расхождения при пересчёте.
+
+---
+
+## Текущее состояние
+
+Готово:
+
+- контейнер OPM Flow 2026.04, прогон Model_Y за 92 с
+- прогон истории 2007→2014: снимок пласта и датасет 80 месяцев
+- опорный сценарий 2014–2022: **ЧДД 2 497,1 млн руб**
+- расчёт ЧДД по эталону организаторов, сверен
+- мост UNSMRY → формат расчёта
+- 99 возмущающих прогонов для матрицы влияния
+
+В работе:
+
+- матрица влияния (корреляция + CRM) — Камелия
+- `ScheduleBuilder`: генерация `wells_schedule.inc`
+- цикл оптимизации на дискретной сетке
+- агентный слой и дашборд
+
+---
+
+## Сдача
+
+Организаторам уходит `submission/`:
+
+- `wells_schedule.inc` — расписание, читается моделью без правок
+- заявленное значение ЧДД
+- исходный код, документация, инструкция запуска, Docker
+
+Один контрольный расчёт на их стороне. Расхождение сверх пары процентов
+— дисквалификация, повторов нет.
