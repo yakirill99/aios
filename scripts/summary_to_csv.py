@@ -30,13 +30,18 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
-from datetime import datetime
+from datetime import date, datetime
 
 OIL_DENSITY = 0.833      # т/м3, среднее по DENSITY из pvt.inc (832/834 кг/м3)
 MAX_WLPR = 500.0         # жёсткий предел методики
 
 COLUMNS = ["DATA", "well", "WLPT", "WLPR", "WOMT", "WOMR", "WWIR", "WWIT",
            "THP", "BHP", "WEFF", "WLPT_Diff", "WOMT_Diff", "WWIT_Diff"]
+
+
+def _prev_month(d: date) -> date:
+    """Первое число предыдущего месяца."""
+    return date(d.year - 1, 12, 1) if d.month == 1 else date(d.year, d.month - 1, 1)
 
 
 def read_summary(path: str, oil_density: float, start: str | None = None):
@@ -96,7 +101,11 @@ def read_summary(path: str, oil_density: float, start: str | None = None):
                 warnings.append(f"{w} {d}: WLPR={wlpr[i]:.1f} > {MAX_WLPR}")
 
             rows.append({
-                "DATA": d.replace(day=1).isoformat(),
+                # ВАЖНО: разность в точке T — это добыча за ПРЕДЫДУЩИЙ
+                # месяц (накопленное на 01.02 минус на 01.01 = январь).
+                # Помечаем месяцем добычи, иначе период съезжает на месяц
+                # и декабрь 2015 «появляется», хотя разности для него нет.
+                "DATA": _prev_month(d).isoformat(),
                 "well": w,
                 "WLPT": round(wlpt[i], 4),
                 "WLPR": round(wlpr[i], 4),
@@ -153,8 +162,22 @@ def read_summary(path: str, oil_density: float, start: str | None = None):
     # Строки с нулевыми разностями НЕ удаляем: нулевой дебит означает
     # остановленную скважину, а по этим записям эталон считает события
     # остановки и пуска. Раньше их отсев терял 21 событие за 2007 год.
+    # Первая точка периода даёт разность за месяц ДО начала управления —
+    # это история, в наш расчёт она не входит.
+    if start_d:
+        before = [r for r in rows if r["DATA"] < start_d.isoformat()]
+        if before:
+            rows = [r for r in rows if r["DATA"] >= start_d.isoformat()]
+            print(f"  отброшено {len(before)} строк за месяц до начала "
+                  f"управления")
+
     if dropped:
         print(f"  свёрнуто внутримесячных точек: {dropped}")
+
+    if rows:
+        months = sorted({r["DATA"][:7] for r in rows})
+        print(f"  месяцев в расчёте: {len(months)} "
+              f"({months[0]} .. {months[-1]})")
 
     rows.sort(key=lambda r: (r["DATA"], r["well"]))
     return rows, wells, warnings
