@@ -1,0 +1,38 @@
+# Параметры прогона. Единственное место, где заданы даты и горизонт.
+# Все скрипты читают их отсюда либо из lib_common.sh.
+
+model:
+  vendor: vendor/model/Model_Y          # эталон, не изменять
+  work:   model/Model_Y_opm             # адаптирована под OPM Flow
+  base:   model/Model_Y_base            # опорный сценарий
+
+# Подтверждено организаторами для обучающей Model_Y.
+# В валидационном кейсе даты придут свои — не зашивать в код.
+horizon:
+  cut_date:  2014-01-01                 # начало управления
+  end_date:  2015-12-01                 # последний расчётный шаг деки
+  months:    23                         # управляющих месяцев
+  discount_base_year: 2014              # y0 для дисконтирования
+
+simulator:
+  image:   aios/opm:2026.04             # версия фиксирована
+  threads: 2                            # потоков на процесс
+  parallel: 6                           # процессов одновременно
+  mem_limit_gb: 4                       # лимит контейнера
+
+npv:
+  engine: vendor/chdd                   # эталонный расчёт организаторов
+  charge_initial_pump: true             # подтверждено сверкой: 57 vs 58 операций
+  oil_density: 0.833                    # т/м3, из DENSITY в pvt.inc
+
+optimizer:
+  step_months: 3                        # шаг управления
+  lookahead_months: 23                  # ограничен концом горизонта
+  candidates_per_step: 20
+  levels: [0.5, 0.7, 1.25, 1.5, 1.75]   # множители режима
+  n_prod: 4                             # добывающих в рассмотрении
+  n_inj:  2                             # нагнетательных
+
+guards:
+  min_free_disk_gb: 30
+  min_free_ram_gb:  4
