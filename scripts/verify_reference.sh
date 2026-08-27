@@ -19,8 +19,11 @@ source lib_common.sh
 
 REF="${REF:-5326.5}"          # эталон организаторов на OPM Flow, млн руб
 REF_TN="${REF_TN:-5261.2}"    # их же на tNavigator
+# Конец истории модели. НЕ путать с датой начала управления (CUT_DATE):
+# сверка идёт на всём периоде 2007-2015, а управление начинается 01.01.2014.
 HIST_END="${HIST_END:-2015-12-01}"
-BASE_END_Y="${BASE_END_Y:-2022}"
+BASE_CUT="${BASE_CUT:-$CUT_DATE}"       # начало управления
+BASE_END_Y="${BASE_END_Y:-${END_YEAR:-2015}}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -122,11 +125,24 @@ RC=$?
 
 # =========================================================================
 echo
-echo "${B}ШАГ 3. Baseline от конца истории${N}"
-echo "  передача управления: ${HIST_END}, горизонт до ${BASE_END_Y}"
-"$SCRIPT_DIR/prepare_baseline.sh" "$HIST_END" "$BASE_END_Y"
+echo "${B}ШАГ 3. Baseline${N}"
+# ВАЖНО: точка передачи управления (CUT_DATE) НЕ совпадает с концом
+# истории (HIST_END). Для Model_Y это 2014-01-01 против 2015-12-01.
+# Раньше здесь стояли зашитые даты конца истории, и запуск затирал
+# правильную планку на 23 месяца планкой на другом горизонте.
+BJ="$RUNS_DIR/baseline/baseline_npv.json"
+if [ -f "$BJ" ] && [ "${FORCE_BASELINE:-0}" != "1" ]; then
+    echo "  ${C}baseline уже посчитан${N} — пропускаю"
+    python3 -c "
+import json;d=json.load(open('$BJ',encoding='utf-8'))
+ys=[y['year'] for y in d['years']]
+print(f\"  {d['npv_mln_rub']:,.1f} млн руб, годы {min(ys)}-{max(ys)}\")" 2>/dev/null
+else
+    echo "  точка управления: ${CUT_DATE}, горизонт до ${END_YEAR}"
+    "$SCRIPT_DIR/prepare_baseline.sh" "$CUT_DATE" "$END_YEAR"
+fi
 
 echo
-echo "${G}ГОТОВО.${N} Дальше:"
-echo "  1) зафиксировать CUT_DATE=${HIST_END} в lib_common.sh"
-echo "  2) перезапустить цикл от новой планки"
+echo "${G}ГОТОВО.${N}"
+echo "  сверка на периоде 2007 → ${HIST_END}"
+echo "  планка на периоде ${CUT_DATE} → ${END_YEAR}-12-01"
