@@ -20,6 +20,24 @@
 
 Цикл возобновляем: состояние пишется в journal.json после каждого шага.
 Ничего не удаляет без --force.
+
+    python3 rolling_horizon.py run --llm off      правила (умолчание)
+    python3 rolling_horizon.py run --llm live     агент отбирает кандидатов
+    python3 rolling_horizon.py run --llm replay   только кэш, ноль вызовов
+
+Правки после ревью 27.08.2026:
+  Д1  обрезка кандидатов перенесена из make_candidates в цикл — срез
+      out[:K] отрезал пакетные варианты, которые добавляются последними
+  Д2  состояние следующего шага берётся из ПРИНЯТОГО варианта, а не из
+      лучшего: при отклонении по порогу выигрыша цикл планировал по
+      реальности, которой нет в расписании
+  Д3  умолчания CLI приведены к Config и к конфигурации лучшего прогона
+  Д4  расчёт ЧДД идёт с SUBMISSION_ASSUMPTIONS — теми же допущениями,
+      которыми пройдена сверка с эталоном
+  Д5  пороги диагностики берутся из Config, а не дублируются литералами
+  Д6  пропущенные шаги пишутся в журнал, resume больше не расходится
+  Д7  расписание рендерится один раз; финальная дека собирается из того
+      же файла, который уходит в сдачу
 """
 from __future__ import annotations
 
@@ -40,6 +58,20 @@ from probe_wells import WellMode, parse_schedule                     # noqa
 from schedule_builder import (Action, ScheduleBuilder, build_deck,    # noqa
                               MAX_LIQUID_RATE)
 
+# Агентный слой необязателен: без него цикл работает на правилах.
+try:
+    from agents import AgentLayer
+    from llm_client import LLMClient
+    HAS_AGENTS = True
+except ImportError:
+    HAS_AGENTS = False
+
+# Д4. Допущения расчёта ЧДД. ОДНО место на весь проект.
+# Сверка с эталоном организаторов выбрала вариант с начислением первичной
+# установки ЭЦН: +0,92% против +3,53% без него. Заявляемое число обязано
+# считаться теми же допущениями, что и проверенное.
+SUBMISSION_ASSUMPTIONS = {"chargeInitialPump": True}
+
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
           "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 
@@ -55,10 +87,13 @@ class Config:
     # На горизонте 23 месяца смотреть вперёд дальше конца бессмысленно:
     # окно всегда обрезается концом деки.
     lookahead_months: int = 23          # глубина прогноза
-    max_candidates: int = 20            # K на шаг
+    max_candidates: int = 25            # K на шаг
     n_prod: int = 4                     # добывающих в рассмотрении
     n_inj: int = 2                      # нагнетательных
-    levels: tuple = (0.5, 0.7, 1.25, 1.5, 1.75)
+    # Д3. Набор, на котором получен лучший результат (+125,2 млн).
+    # Умолчания CLI обязаны совпадать с этими — иначе запуск без
+    # аргументов молча считает другую задачу.
+    levels: tuple = (0.7, 1.25, 1.75, 2.25, 3.0)
     parallel: int = 6
     # Медиана лага отклика по матрице с окном 60 мес — 10 месяцев.
     # Трогать скважину чаще бессмысленно: результат предыдущего
@@ -80,8 +115,10 @@ class Config:
     trig_inj_useless: float = 0.0       # нагнетательная без связей в матрице
     trig_min_gain_mln: float = 2.0      # ниже — не стоит переключения
     trig_force_first: bool = True       # первый шаг всегда активный
+    headroom_min: float = 0.5           # доля запаса до предела по жидкости
     image: str = "aios/opm:2026.04"
     mem_limit_gb: int = 4
+    llm_mode: str = "off"               # off | live | replay
 
 
 @dataclass
@@ -96,6 +133,10 @@ class StepRecord:
     n_candidates: int
     duration_s: float
     diagnosis: dict = field(default_factory=dict)
+    # объяснения агентного слоя — источник данных для панели дашборда
+    analyst_summary: str = ""
+    explanation: str = ""
+    risk: str = ""
 
 
 # ==========================================================================
@@ -157,13 +198,16 @@ def diagnose(states: dict[str, WellState], step: int, cfg: Config) -> dict:
             continue
         if st.kind != "prod":
             continue
-        if st.wct > 0.975:
+        # Д5. Пороги берутся из Config, а не дублируются литералами:
+        # иначе систему можно настроить в противоречивое состояние —
+        # триггер сработает, а диагностика промолчит.
+        if st.wct > cfg.trig_watercut:
             findings["water_breakthrough"].append(n)
         if st.margin_rub_day < 0:
             findings["unprofitable"].append(n)
-        if st.headroom > 0.5:
+        if st.headroom > cfg.headroom_min:
             findings["headroom"].append(n)
-        if st.decline > 0.08:
+        if st.decline > cfg.trig_decline:
             findings["declining"].append(n)
 
     return {k: v[:6] for k, v in findings.items()}
@@ -329,8 +373,11 @@ def make_candidates(targets: list[WellState], at: date, cfg: Config
         if len(acts) >= 3:
             out.append(("PACK_full", acts))
 
-    if len(out) > cfg.max_candidates:
-        out = out[:cfg.max_candidates]
+    # Д1. ОБРЕЗКИ ЗДЕСЬ НЕТ.
+    # Пакетные кандидаты добавляются последними, поэтому срез out[:K]
+    # отрезал ровно их — те самые, что дают больше одиночных воздействий.
+    # Отбор до K перенесён в цикл, после ранжирования (правилового или
+    # агентского), где пакеты стоят сразу за noop.
     return out
 
 
@@ -397,7 +444,9 @@ class Runner:
         # chdd_model.py, resdata не требуется
         try:
             from npv_official import compute_npv_from_csv
-            return compute_npv_from_csv(str(csv), start_year=start.year).npv
+            return compute_npv_from_csv(
+                str(csv), start_year=start.year,
+                assumptions=dict(SUBMISSION_ASSUMPTIONS)).npv
         except Exception as e:
             print(f"    ошибка ЧДД: {e}")
             return None
@@ -431,6 +480,20 @@ def load_matrix_lags(path: Path) -> dict[str, list[int]]:
     return out
 
 
+def _rule_order(cands: list[tuple]) -> list[tuple]:
+    """
+    Правиловый порядок кандидатов: noop, пакеты, одиночные.
+
+    Пакеты идут вперёд намеренно: одновременные воздействия дают заметно
+    больше растянутых по шагам, потому что дисконт удешевляет позднее
+    воздействие. При обрезке до K первыми должны выживать они.
+    """
+    noop = [c for c in cands if c[0] == "noop"]
+    packs = [c for c in cands if c[0].startswith("PACK")]
+    rest = [c for c in cands if c[0] != "noop" and not c[0].startswith("PACK")]
+    return noop + packs + rest
+
+
 def useful_degree(lags: dict[str, list[int]], well: str,
                   months_left: int) -> int:
     """Сколько связей скважины успеют проявиться за оставшееся время."""
@@ -461,6 +524,16 @@ class RollingHorizon:
         self.jpath = self.wd / "journal.json"
         self.lock = self.wd / ".lock"
 
+        # Агентный слой. В режиме off все роли возвращают правиловый
+        # результат, цикл считает ровно то же, что и без него.
+        if HAS_AGENTS:
+            self.agents = AgentLayer(LLMClient(mode=cfg.llm_mode),
+                                     trace_path=self.wd / "llm_trace.jsonl")
+        else:
+            self.agents = None
+            if cfg.llm_mode != "off":
+                print("  agents.py не найден — цикл идёт на правилах")
+
     def acquire_lock(self) -> None:
         """
         Защита от повторного запуска. Два экземпляра пишут в один каталог
@@ -482,6 +555,15 @@ class RollingHorizon:
         atexit.register(lambda: self.lock.unlink(missing_ok=True))
 
     # ------------------------------------------------------------------
+    def _log_skip(self, step: int, cur, reason: str, diag: dict,
+                  t0: float) -> None:
+        """Шаг без решения тоже попадает в журнал — иначе resume поедет."""
+        self.journal.append(StepRecord(
+            step=step, date=cur.isoformat(), chosen_tag=reason,
+            chosen_actions=[], npv_window=0.0, npv_noop=0.0, gain=0.0,
+            n_candidates=0, duration_s=time.time() - t0, diagnosis=diag))
+        self.save()
+
     def n_steps(self) -> int:
         n, d = 0, self.cfg.cut
         while d < self.cfg.end:
@@ -627,20 +709,44 @@ class RollingHorizon:
             for r in reasons:
                 print(f"  ТРИГГЕР: {r}")
 
+            analyst = ""
+            if self.agents is not None:
+                rep_ = self.agents.analyze(act_diag, step, months_left, reasons)
+                analyst = rep_.summary
+                print(f"  аналитик: {analyst}")
+
             targets = pick_targets(self.states, diag, step, self.cfg,
                                    self.lags, months_left)
             if not targets:
+                # Д6. Пропуск тоже пишется в журнал: иначе resume пройдёт
+                # шаг заново, но уже с другим состоянием, и цикл перестанет
+                # быть воспроизводимым.
                 print("  нет доступных скважин (интервал между воздействиями)")
+                self._log_skip(step, cur, "no_targets", act_diag, t0)
                 cur = add_months(cur, self.cfg.step_months)
                 continue
             print(f"  рассматриваем: {', '.join(t.name for t in targets)}")
 
             cands = make_candidates(targets, cur, self.cfg)
-            print(f"  кандидатов: {len(cands)}")
+            print(f"  кандидатов сгенерировано: {len(cands)}")
+
+            # Д1. Отбор до max_candidates происходит ЗДЕСЬ, после
+            # ранжирования. В режиме off порядок правиловый:
+            # noop, пакеты, одиночные — пакеты больше не отрезаются.
+            if self.agents is not None:
+                cands = self.agents.rank_candidates(
+                    cands, act_diag, step, months_left,
+                    limit=self.cfg.max_candidates)
+                who = "агент" if self.cfg.llm_mode != "off" else "правила"
+            else:
+                cands = _rule_order(cands)[:self.cfg.max_candidates]
+                who = "правила"
+            print(f"  отобрано на прогон: {len(cands)} ({who})")
 
             res = self.evaluate(cands, horizon_end, step)
             if not res:
                 print("  ни один кандидат не посчитался — пропуск шага")
+                self._log_skip(step, cur, "no_results", act_diag, t0)
                 cur = add_months(cur, self.cfg.step_months)
                 continue
 
@@ -653,7 +759,9 @@ class RollingHorizon:
                   f"({gain:+.1f} к noop)")
 
             chosen = dict(cands)[best_tag]
-            if best_tag != "noop" and gain >= self.cfg.trig_min_gain_mln:
+            accept = (best_tag != "noop"
+                      and gain >= self.cfg.trig_min_gain_mln)
+            if accept:
                 self.schedule.extend(chosen)
                 for a in chosen:
                     if a.well in self.states:
@@ -663,9 +771,17 @@ class RollingHorizon:
                 print(f"  выигрыш {gain:+.1f} млн ниже порога "
                       f"{self.cfg.trig_min_gain_mln} — не переключаемся")
 
-            # зачётный прогон: состояние для следующего шага
+            # Д2. Зачётным становится прогон ПРИНЯТОГО варианта.
+            # Раньше при отклонении в расписание не шло ничего, а состояние
+            # читалось из прогона С этим воздействием — цикл планировал по
+            # реальности, которой нет, и ошибка копилась по шагам.
+            accepted_tag = best_tag if accept else (
+                "noop" if "noop" in res else best_tag)
+            if accepted_tag != best_tag:
+                print(f"  состояние берём из {accepted_tag}, "
+                      f"а не из {best_tag}")
             zach = self.wd / "runs" / f"s{step:02d}_ACCEPTED"
-            src = self.wd / "runs" / f"s{step:02d}_{best_tag}"
+            src = self.wd / "runs" / f"s{step:02d}_{accepted_tag}"
             if src.exists():
                 if zach.exists():
                     shutil.rmtree(zach)
@@ -675,12 +791,20 @@ class RollingHorizon:
             if sm:
                 self.states = read_state(self.runner, sm, nxt, self.states)
 
+            explanation, risk = "", ""
+            if self.agents is not None:
+                v = self.agents.explain(best_tag, gain, res, step, months_left)
+                explanation, risk = v.explanation, v.risk
+                print(f"  критик: {explanation} (риск {risk})")
+
             self.journal.append(StepRecord(
-                step=step, date=cur.isoformat(), chosen_tag=best_tag,
+                step=step, date=cur.isoformat(),
+                chosen_tag=best_tag if accept else "rejected",
                 chosen_actions=[asdict(a) for a in chosen],
                 npv_window=best_npv, npv_noop=noop_npv, gain=gain,
                 n_candidates=len(cands), duration_s=time.time() - t0,
-                diagnosis=act_diag))
+                diagnosis=act_diag, analyst_summary=analyst,
+                explanation=explanation, risk=risk))
             self.save()
 
             # чистим пробные прогоны шага, оставляем зачётный
@@ -702,17 +826,26 @@ class RollingHorizon:
     # ------------------------------------------------------------------
     def finalize(self) -> None:
         print("=== финальный прогон полного расписания ===")
-        deck = self.build("FINAL", [], self.cfg.end)
+
+        # Д7. Расписание рендерится ОДИН раз, и финальная дека собирается
+        # из того же файла, который уходит в сдачу. Раньше их было два:
+        # проверяли один объект, сдавали другой.
+        inc = self.wd / "wells_schedule.inc"
+        b = ScheduleBuilder(self.modes, self.cfg.cut, self.cfg.end)
+        b.add_many(self.schedule)
+        issues = [i for i in b.validate() if i.severity == "error"]
+        if issues:
+            print(f"расписание не прошло валидацию: {issues[0].message}")
+            return
+        inc.write_text(b.render(), encoding="utf-8")
+
+        deck = self.wd / "decks" / "FINAL"
+        build_deck(self.cfg.base, deck, self.cfg.cut, inc, force=True)
         out = self.wd / "runs" / "FINAL"
         if not self.runner.simulate(deck, out, threads=4):
             print("финальный прогон не удался")
             return
         npv = self.runner.npv(out, self.cfg.cut)
-
-        inc = self.wd / "wells_schedule.inc"
-        b = ScheduleBuilder(self.modes, self.cfg.cut, self.cfg.end)
-        b.add_many(self.schedule)
-        inc.write_text(b.render(), encoding="utf-8")
 
         print(f"\nвсего времени: {(time.time()-self.t_start)/60:.0f} мин")
         print(f"ЧДД итогового расписания: {npv:,.1f} млн руб")
@@ -723,9 +856,16 @@ class RollingHorizon:
         print(f"воздействий: {len(self.schedule)}")
         print(f"расписание:  {inc}")
 
+        print(f"\nПРОВЕРЬТЕ ПЕРЕД СДАЧЕЙ:")
+        print(f"  ./validate.sh {out} --since {self.cfg.cut}")
+
         (self.wd / "result.json").write_text(json.dumps({
             "npv": npv, "baseline": getattr(self, "baseline", None),
             "n_actions": len(self.schedule),
+            "assumptions": SUBMISSION_ASSUMPTIONS,
+            "cut": self.cfg.cut.isoformat(), "end": self.cfg.end.isoformat(),
+            "levels": list(self.cfg.levels), "step_months": self.cfg.step_months,
+            "llm_mode": self.cfg.llm_mode,
             "schedule": [asdict(a) for a in self.schedule],
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -740,12 +880,19 @@ def main() -> None:
                    help="дата передачи управления (конец истории)")
     p.add_argument("--end", default="2015-12-01",
                    help="горизонт ЧДД ограничен декой")
-    p.add_argument("--step", type=int, default=6, help="шаг управления, мес")
-    p.add_argument("--lookahead", type=int, default=24, help="прогноз, мес")
-    p.add_argument("--candidates", type=int, default=20)
+    # Д3. Умолчания совпадают с Config и с конфигурацией, на которой
+    # получен лучший результат. Запуск без аргументов обязан его
+    # воспроизводить.
+    _d = Config(base=Path("."), workdir=Path("."))
+    p.add_argument("--step", type=int, default=_d.step_months,
+                   help="шаг управления, мес")
+    p.add_argument("--lookahead", type=int, default=_d.lookahead_months,
+                   help="прогноз, мес")
+    p.add_argument("--candidates", type=int, default=_d.max_candidates)
     p.add_argument("--prod", type=int, default=4)
     p.add_argument("--inj", type=int, default=2)
-    p.add_argument("--levels", default="0.5,0.7,1.25,1.5,1.75",
+    p.add_argument("--levels",
+                   default=",".join(f"{x:g}" for x in _d.levels),
                    help="множители режима")
     p.add_argument("--parallel", type=int, default=6)
     p.add_argument("--no-triggers", action="store_true",
@@ -753,6 +900,8 @@ def main() -> None:
     p.add_argument("--min-gain", type=float, default=2.0,
                    help="порог выигрыша, млн руб: ниже не переключаемся")
     p.add_argument("--matrix", default="~/aios-data/probes/response_matrix.csv")
+    p.add_argument("--llm", default="off", choices=["off", "live", "replay"],
+                   help="режим агентного слоя")
     a = p.parse_args()
 
     cfg = Config(
@@ -764,7 +913,8 @@ def main() -> None:
         levels=tuple(float(x) for x in a.levels.split(",")),
         parallel=a.parallel,
         use_triggers=not a.no_triggers,
-        trig_min_gain_mln=a.min_gain)
+        trig_min_gain_mln=a.min_gain,
+        llm_mode=a.llm)
 
     rh = RollingHorizon(cfg, Path(a.matrix).expanduser() if a.matrix else None)
 

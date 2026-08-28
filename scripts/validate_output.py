@@ -10,9 +10,20 @@ OutputValidator — проверка физической корректност
 Запускается ВНУТРИ контейнера (нужен resdata):
 
     python3 validate_output.py /out/MODEL_Y.SMSPEC
+    python3 validate_output.py /out/MODEL_Y.SMSPEC --since 2014-01-01
     python3 validate_output.py /out/MODEL_Y.SMSPEC --json /out/validation.json
 
 Код возврата: 0 — чисто, 1 — есть нарушения.
+
+Д8. Флаг --since печатает ОТДЕЛЬНУЮ сводку по управляющему периоду.
+Нарушение внутри истории — вопрос к деке организаторов, нарушение внутри
+нашего окна — наша дисквалификация. Разница существенная, и её видно
+только если считать отдельно.
+
+Д9. Проверка компенсации закачки. Лектор предупредил, что оптимизатор
+«в лоб» разгоняет закачку в максимум. Порог задаётся, потому что точная
+формула — зона ответственности гидродинамика; по умолчанию нарушение
+даётся предупреждением, а не ошибкой.
 """
 from __future__ import annotations
 
@@ -29,6 +40,11 @@ MAX_BHP_INJ = 300.0         # бар — предел нагнетательны
 MAX_PRESSURE = 500.0        # бар — здравый смысл для пластового
 MIN_PRESSURE = 1.0
 TOL = 1e-6                  # допуск на численный шум
+
+# компенсация: отношение накопленной закачки к накопленному отбору
+# жидкости за проверяемый период
+COMP_MIN = 0.80
+COMP_MAX = 1.20
 
 
 @dataclass
@@ -47,6 +63,8 @@ class Report:
     total_steps: int = 0
     total_wells: int = 0
     period: str = ""
+    scope: str = "весь горизонт"
+    compensation: float | None = None
     errors: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     checks_run: list = field(default_factory=list)
@@ -56,12 +74,26 @@ class Report:
         return not self.errors
 
 
-def validate(smspec: str, max_report: int = 8) -> Report:
+def validate(smspec: str, max_report: int = 8, since=None,
+             comp_min: float = COMP_MIN, comp_max: float = COMP_MAX,
+             comp_hard: bool = False) -> Report:
     from resdata.summary import Summary
 
     s = Summary(smspec)
     keys = set(s.keys())
-    dates = [d.date() if hasattr(d, "date") else d for d in s.dates]
+    all_dates = [d.date() if hasattr(d, "date") else d for d in s.dates]
+
+    # Д8. Окно проверки. Индексы срезаются от даты передачи управления,
+    # а не от начала сводки: нумерация шагов обязана совпадать с той,
+    # по которой считается ЧДД.
+    if since:
+        idx = [i for i, d in enumerate(all_dates) if d >= since]
+        if not idx:
+            raise SystemExit(f"в сводке нет точек начиная с {since}")
+        i0 = idx[0]
+    else:
+        i0 = 0
+    dates = all_dates[i0:]
 
     wells = sorted({k.split(":", 1)[1] for k in keys if ":" in k
                     and any(f"{m}:{k.split(':',1)[1]}" in keys
@@ -70,9 +102,12 @@ def validate(smspec: str, max_report: int = 8) -> Report:
     rep = Report(total_steps=len(dates), total_wells=len(wells),
                  period=f"{dates[0]} .. {dates[-1]}" if dates else "")
 
+    rep.scope = (f"управляющий период с {since}" if since
+                 else "весь горизонт")
+
     def vec(name: str, w: str):
         k = f"{name}:{w}"
-        return list(s.numpy_vector(k)) if k in keys else None
+        return list(s.numpy_vector(k))[i0:] if k in keys else None
 
     def err(check, well, i, val, lim, msg):
         rep.errors.append(asdict(Issue("error", check, well,
@@ -171,9 +206,31 @@ def validate(smspec: str, max_report: int = 8) -> Report:
                         f"технический сброс счётчика или сбой")
                     break
 
+    # --- Д9. КОМПЕНСАЦИЯ ЗАКАЧКИ ---------------------------------------
+    # Считается по накопленным на границах окна: закачано за период
+    # против поднято жидкости за период. Оптимизатор, максимизирующий
+    # ЧДД без этого ограничения, уводит закачку в потолок.
+    rep.checks_run.append(f"компенсация закачки в [{comp_min}, {comp_max}]")
+    tot_inj = tot_liq = 0.0
+    for w in wells:
+        wwit, wlpt = vec("WWIT", w), vec("WLPT", w)
+        if wwit:
+            tot_inj += wwit[-1] - wwit[0]
+        if wlpt:
+            tot_liq += wlpt[-1] - wlpt[0]
+    if tot_liq > 1.0:
+        comp = tot_inj / tot_liq
+        rep.compensation = round(comp, 4)
+        if comp < comp_min or comp > comp_max:
+            msg = (f"компенсация {comp:.3f} вне [{comp_min}, {comp_max}]: "
+                   f"закачано {tot_inj/1000:,.1f} тыс.м3 против "
+                   f"{tot_liq/1000:,.1f} тыс.м3 отбора")
+            (err if comp_hard else warn)(
+                "compensation", "FIELD", 0, comp, comp_max, msg)
+
     # --- поле в целом --------------------------------------------------
     if "FPR" in keys:
-        fpr = list(s.numpy_vector("FPR"))
+        fpr = list(s.numpy_vector("FPR"))[i0:]
         for i, x in enumerate(fpr):
             if math.isnan(x) or x < MIN_PRESSURE or x > MAX_PRESSURE:
                 err("field_pressure", "FIELD", i, x, MAX_PRESSURE,
@@ -185,8 +242,11 @@ def validate(smspec: str, max_report: int = 8) -> Report:
 
 def print_report(rep: Report, max_show: int = 8) -> None:
     print(f"проверено: {rep.total_wells} скважин x {rep.total_steps} шагов")
-    print(f"период: {rep.period}")
+    print(f"область:  {rep.scope}")
+    print(f"период:   {rep.period}")
     print(f"проверок: {len(rep.checks_run)}")
+    if rep.compensation is not None:
+        print(f"компенсация закачки: {rep.compensation:.3f}")
 
     if rep.errors:
         print(f"\n  ОШИБОК: {len(rep.errors)}")
@@ -216,17 +276,36 @@ def main() -> None:
     p.add_argument("smspec")
     p.add_argument("--json", help="сохранить отчёт")
     p.add_argument("--max-show", type=int, default=8)
+    p.add_argument("--since", help="дата передачи управления, напр. 2014-01-01: "
+                                   "печатается отдельная сводка по окну")
+    p.add_argument("--comp-min", type=float, default=COMP_MIN)
+    p.add_argument("--comp-max", type=float, default=COMP_MAX)
+    p.add_argument("--comp-hard", action="store_true",
+                   help="считать нарушение компенсации ошибкой, а не "
+                        "предупреждением")
     a = p.parse_args()
 
-    rep = validate(a.smspec)
-    print_report(rep, a.max_show)
+    reports = [validate(a.smspec, comp_min=a.comp_min, comp_max=a.comp_max,
+                        comp_hard=a.comp_hard)]
+    if a.since:
+        from datetime import date as _date
+        reports.append(validate(a.smspec, since=_date.fromisoformat(a.since),
+                                comp_min=a.comp_min, comp_max=a.comp_max,
+                                comp_hard=a.comp_hard))
+
+    for i, rep in enumerate(reports):
+        if i:
+            print("\n" + "=" * 60)
+        print_report(rep, a.max_show)
 
     if a.json:
+        payload = ([asdict(r) for r in reports] if len(reports) > 1
+                   else asdict(reports[0]))
         with open(a.json, "w", encoding="utf-8") as f:
-            json.dump(asdict(rep), f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
         print(f"\nотчёт: {a.json}")
 
-    sys.exit(0 if rep.ok else 1)
+    sys.exit(0 if all(r.ok for r in reports) else 1)
 
 
 if __name__ == "__main__":

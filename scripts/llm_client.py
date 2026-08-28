@@ -127,7 +127,9 @@ def _self_test() -> int:
         well: str = Field(description="номер скважины")
         control: Literal["LRAT", "RATE", "SHUT"] = Field(
             description="тип воздействия")
-        level: Literal[0.5, 0.7, 1.25, 1.5] = Field(
+        # Д11. Набор совпадает с рабочей сеткой оптимизатора: при демо
+        # разные наборы в тесте и в цикле выглядят как рассинхрон.
+        level: Literal[0.7, 1.25, 1.75, 2.25, 3.0] = Field(
             description="множитель текущего режима")
         reason: str = Field(description="обоснование, одно предложение")
 
@@ -165,7 +167,7 @@ def _self_test() -> int:
 
     print("\n4. режим off (деградация до правил):")
     off = LLMClient(mode="off")
-    fb = WellAction(well="42", control="RATE", level=1.5, reason="правило")
+    fb = WellAction(well="42", control="RATE", level=1.25, reason="правило")
     r3 = off.complete(prompt, WellAction, fallback=fb)
     print(f"   вернул fallback: {r3.well} {r3.control} x{r3.level}")
 
