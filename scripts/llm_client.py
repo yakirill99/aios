@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Type
 
@@ -33,7 +34,10 @@ class LLMClient:
                  model: str = "qwen3:14b",
                  host: str = "http://localhost:11434",
                  cache_dir: str | Path = "~/aios-data/llm_cache",
-                 temperature: float = 0.0):
+                 temperature: float = 0.0,
+                 timeout: int = 600,
+                 num_predict: int = 768,
+                 num_ctx: int = 8192):
         self.mode = os.environ.get("AIOS_LLM_MODE", mode)
         self.model = os.environ.get("AIOS_LLM_MODEL", model)
         self.host = host.rstrip("/")
@@ -41,6 +45,22 @@ class LLMClient:
         self.cache = Path(cache_dir).expanduser()
         self.cache.mkdir(parents=True, exist_ok=True)
         self.calls = self.cache_hits = 0
+
+        # Тайм-аут. 180 с не хватало: у схем с вложенными массивами
+        # (список гипотез, список кандидатов) модель генерирует в разы
+        # больше токенов, чем у плоской схемы критика, а первый вызов
+        # ещё и грузит веса в память.
+        self.timeout = int(os.environ.get("AIOS_LLM_TIMEOUT", timeout))
+        # Потолок длины ответа: без него думающая модель уходит в
+        # рассуждение на тысячи токенов.
+        self.num_predict = int(os.environ.get("AIOS_LLM_NUM_PREDICT",
+                                              num_predict))
+        self.num_ctx = int(os.environ.get("AIOS_LLM_NUM_CTX", num_ctx))
+        # qwen3 по умолчанию думает перед ответом. В структурированном
+        # выводе рассуждение не нужно и стоит десятков секунд.
+        self.think = os.environ.get("AIOS_LLM_THINK", "0") not in ("0", "")
+        self._think_supported = True
+        self.total_s = 0.0
 
     # ------------------------------------------------------------------
     def _key(self, prompt: str, schema: dict) -> Path:
@@ -67,11 +87,18 @@ class LLMClient:
             print("  [llm] промах кэша в режиме replay — возврат к правилам")
             return fallback
 
+        t0 = time.time()
         try:
             raw = self._call(prompt, js, system)
             obj = schema.model_validate_json(raw)
         except Exception as e:
-            print(f"  [llm] ошибка ({type(e).__name__}: {e}) — возврат к правилам")
+            dt = time.time() - t0
+            print(f"  [llm] ошибка за {dt:.0f} с "
+                  f"({type(e).__name__}: {e}) — возврат к правилам")
+            if isinstance(e, TimeoutError) or "timed out" in str(e).lower():
+                print(f"       тайм-аут {self.timeout} с. Проверьте:")
+                print(f"       ollama ps            модель должна быть 100% GPU")
+                print(f"       AIOS_LLM_TIMEOUT=900 AIOS_LLM_NUM_PREDICT=512")
             return fallback
 
         path.write_text(obj.model_dump_json(), encoding="utf-8")
@@ -80,28 +107,81 @@ class LLMClient:
 
     # ------------------------------------------------------------------
     def _call(self, prompt: str, schema: dict, system: str) -> str:
+        import urllib.error
         import urllib.request
 
         msgs = ([{"role": "system", "content": system}] if system else []) + \
                [{"role": "user", "content": prompt}]
-        body = json.dumps({
-            "model": self.model,
-            "messages": msgs,
-            "stream": False,
-            "format": schema,                 # ограничение декодирования
-            "options": {"temperature": self.temperature, "seed": 42},
-        }).encode()
 
-        req = urllib.request.Request(
-            f"{self.host}/api/chat", data=body,
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=180) as r:
-            return json.loads(r.read())["message"]["content"]
+        def _body(with_think: bool) -> bytes:
+            payload = {
+                "model": self.model,
+                "messages": msgs,
+                "stream": False,
+                "format": schema,             # ограничение декодирования
+                # модель остаётся в памяти между вызовами: иначе каждый
+                # шаг цикла заново платит за загрузку весов
+                "keep_alive": "30m",
+                "options": {"temperature": self.temperature, "seed": 42,
+                            "num_predict": self.num_predict,
+                            "num_ctx": self.num_ctx},
+            }
+            if with_think:
+                payload["think"] = self.think
+            return json.dumps(payload).encode()
+
+        def _post(with_think: bool) -> str:
+            req = urllib.request.Request(
+                f"{self.host}/api/chat", data=_body(with_think),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return json.loads(r.read())["message"]["content"]
+
+        t0 = time.time()
+        try:
+            out = _post(self._think_supported)
+        except urllib.error.HTTPError as e:
+            # старые сборки ollama не знают поля think — повторяем без него
+            if self._think_supported and e.code in (400, 404, 422):
+                self._think_supported = False
+                print("  [llm] сервер не принял поле think — повтор без него")
+                out = _post(False)
+            else:
+                raise
+        self.total_s += time.time() - t0
+        return out
 
     # ------------------------------------------------------------------
     def stats(self) -> str:
+        avg = self.total_s / self.calls if self.calls else 0.0
         return (f"вызовов: {self.calls}, из кэша: {self.cache_hits}, "
+                f"среднее {avg:.0f} с, "
                 f"режим: {self.mode}, модель: {self.model}")
+
+    def warmup(self) -> tuple[bool, str]:
+        """
+        Прогрев: короткий вызов без схемы, чтобы веса заехали в память.
+        Первый содержательный вызов иначе платит за загрузку и упирается
+        в тайм-аут — именно так выглядела ошибка 28.08.
+        """
+        if self.mode == "off":
+            return True, "режим off — прогрев не нужен"
+        import urllib.request
+        body = json.dumps({
+            "model": self.model, "stream": False, "keep_alive": "30m",
+            "messages": [{"role": "user", "content": "ok"}],
+            "options": {"num_predict": 1},
+        }).encode()
+        t0 = time.time()
+        try:
+            req = urllib.request.Request(
+                f"{self.host}/api/chat", data=body,
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                r.read()
+            return True, f"модель в памяти, {time.time() - t0:.0f} с"
+        except Exception as e:
+            return False, f"прогрев не удался за {time.time() - t0:.0f} с: {e}"
 
     def health(self) -> tuple[bool, str]:
         if self.mode == "off":
@@ -137,6 +217,10 @@ def _self_test() -> int:
     c = LLMClient(mode="live")
     ok, msg = c.health()
     print(f"1. связь: {msg}")
+    if ok:
+        wok, wmsg = c.warmup()
+        print(f"   прогрев: {wmsg}")
+        ok = wok
     if not ok:
         print("\n   что проверить:")
         print("     ollama serve            запущен ли сервер")
@@ -153,7 +237,8 @@ def _self_test() -> int:
         "Предложи одно воздействие из словаря."
     )
 
-    print("\n2. structured output:")
+    print(f"\n2. structured output (тайм-аут {c.timeout} с, "
+          f"num_predict {c.num_predict}, think {c.think}):")
     r1 = c.complete(prompt, WellAction)
     if r1 is None:
         print("   не получен объект"); return 1

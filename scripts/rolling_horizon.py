@@ -114,6 +114,9 @@ class Config:
     trig_margin_neg: bool = True        # отрицательный вклад в поток
     trig_inj_useless: float = 0.0       # нагнетательная без связей в матрице
     trig_min_gain_mln: float = 2.0      # ниже — не стоит переключения
+    tie_eps_mln: float = 1.0            # зона равенства: внутри неё
+                                        # предпочитается вариант с меньшим
+                                        # числом воздействий
     trig_force_first: bool = True       # первый шаг всегда активный
     headroom_min: float = 0.5           # доля запаса до предела по жидкости
     image: str = "aios/opm:2026.04"
@@ -709,7 +712,7 @@ class RollingHorizon:
             for r in reasons:
                 print(f"  ТРИГГЕР: {r}")
 
-            analyst = ""
+            analyst, rep_ = "", None
             if self.agents is not None:
                 rep_ = self.agents.analyze(act_diag, step, months_left, reasons)
                 analyst = rep_.summary
@@ -751,6 +754,20 @@ class RollingHorizon:
                 continue
 
             best_tag = max(res, key=res.get)
+            # Принцип минимального вмешательства: если несколько вариантов
+            # укладываются в tie_eps_mln по ЧДД, берём тот, где меньше
+            # воздействий. Каждое лишнее переключение — риск смены ЭЦН и
+            # лишняя строка в расписании, которую придётся объяснять.
+            near = [t for t, v in res.items()
+                    if res[best_tag] - v <= self.cfg.tie_eps_mln]
+            if len(near) > 1:
+                acts = {t: len(dict(cands).get(t, [])) for t in near}
+                lean = min(near, key=lambda t: (acts[t], -res[t]))
+                if lean != best_tag and acts[lean] < acts[best_tag]:
+                    print(f"  {lean}: в пределах {self.cfg.tie_eps_mln} млн "
+                          f"от {best_tag}, но воздействий {acts[lean]} "
+                          f"против {acts[best_tag]} — берём его")
+                    best_tag = lean
             best_npv = res[best_tag]
             noop_npv = res.get("noop", best_npv)
             gain = best_npv - noop_npv
@@ -793,7 +810,9 @@ class RollingHorizon:
 
             explanation, risk = "", ""
             if self.agents is not None:
-                v = self.agents.explain(best_tag, gain, res, step, months_left)
+                v = self.agents.explain(
+                    best_tag, gain, res, step, months_left,
+                    hypotheses=getattr(rep_, "hypotheses", None))
                 explanation, risk = v.explanation, v.risk
                 print(f"  критик: {explanation} (риск {risk})")
 
