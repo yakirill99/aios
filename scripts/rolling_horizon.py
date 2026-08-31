@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -890,14 +891,23 @@ class RollingHorizon:
 
 
 # ==========================================================================
+# Пути берутся из окружения, как в lib_common.sh. Зашитый ~/aios ломал
+# работу во второй среде WSL, где репозиторий лежит по другому пути, и
+# цикл молча уходил искать деку не туда.
+AIOS_ROOT = Path(os.environ.get("AIOS_ROOT", "~/aios")).expanduser()
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", "~/aios-data")).expanduser()
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="скользящий горизонт")
     p.add_argument("cmd", choices=["plan", "run", "resume"])
-    p.add_argument("--base", default="~/aios/model/Model_Y_opm")
-    p.add_argument("--workdir", default="~/aios-data/rolling")
-    p.add_argument("--cut", default="2014-01-01",
+    p.add_argument("--base", default=str(AIOS_ROOT / "model/Model_Y_opm"),
+                   help="дека, адаптированная под OPM")
+    p.add_argument("--workdir", default=str(DATA_ROOT / "rolling"))
+    # Даты тоже не зашиты: в валидационном кейсе придут свои.
+    p.add_argument("--cut", default=os.environ.get("CUT_DATE", "2014-01-01"),
                    help="дата передачи управления (конец истории)")
-    p.add_argument("--end", default="2015-12-01",
+    p.add_argument("--end", default=os.environ.get("END_DATE", "2015-12-01"),
                    help="горизонт ЧДД ограничен декой")
     # Д3. Умолчания совпадают с Config и с конфигурацией, на которой
     # получен лучший результат. Запуск без аргументов обязан его
@@ -918,7 +928,8 @@ def main() -> None:
                    help="вмешиваться на каждом шаге (дороже, обычно не нужно)")
     p.add_argument("--min-gain", type=float, default=2.0,
                    help="порог выигрыша, млн руб: ниже не переключаемся")
-    p.add_argument("--matrix", default="~/aios-data/probes/response_matrix.csv")
+    p.add_argument("--matrix",
+                   default=str(DATA_ROOT / "probes/response_matrix.csv"))
     p.add_argument("--llm", default="off", choices=["off", "live", "replay"],
                    help="режим агентного слоя")
     a = p.parse_args()

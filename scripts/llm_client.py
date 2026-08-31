@@ -40,7 +40,9 @@ class LLMClient:
                  num_ctx: int = 8192):
         self.mode = os.environ.get("AIOS_LLM_MODE", mode)
         self.model = os.environ.get("AIOS_LLM_MODEL", model)
-        self.host = host.rstrip("/")
+        # Адрес ollama настраивается снаружи: во второй среде WSL сервер
+        # может быть один на обе (AIOS_LLM_HOST=http://172.28.x.x:11434).
+        self.host = os.environ.get("AIOS_LLM_HOST", host).rstrip("/")
         self.temperature = temperature
         self.cache = Path(cache_dir).expanduser()
         self.cache.mkdir(parents=True, exist_ok=True)
