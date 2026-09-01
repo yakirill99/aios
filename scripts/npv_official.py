@@ -21,6 +21,14 @@
 Использование из терминала:
     python3 npv_official.py chdd_input.csv
     python3 npv_official.py chdd_input.csv --start-year 2014 --json out.json
+
+Сравнение с таблицей организаторов:
+    python3 npv_official.py chdd_input.csv --charge-initial-pump \
+            --annual-csv our_annual.csv --compare ref_annual.csv
+
+--annual-csv пишет годовую разбивку в той же раскладке, что у
+организаторов: показатели строками, годы столбцами. --compare читает
+такой же файл и печатает разницу колонка к колонке.
 """
 from __future__ import annotations
 
@@ -128,6 +136,197 @@ class NPVResult:
 
 
 # --------------------------------------------------------------------------
+# Годовая таблица в раскладке организаторов: показатель — строка,
+# год — столбец. Ключ слева, подпись справа.
+# Названия и единицы взяты из эталонной таблицы организаторов
+# (Etalon_OPM_Flow_Model_Y_final), чтобы строки сопоставлялись один в один.
+ANNUAL_ROWS = [
+    ("oilKt",              "Добыча нефти",                     "тыс. т"),
+    ("liquidKt",           "Добыча жидкости",                  "тыс. т"),
+    ("injectionKm3",       "Закачка",                          "тыс. м3"),
+    ("activeWellMonths",   "Средний действующий фонд",         "скв.-мес"),
+    ("averageActiveWells", "Скважин в среднем за месяц",       "скв."),
+    ("months",             "Месяцев в году",                   "мес"),
+    ("revenueM",           "Выручка от основной деятельности", "млн руб."),
+    ("opexM",              "Полный OPEX",                      "млн руб."),
+    ("capexM",             "CAPEX новых ЭЦН",                  "млн руб."),
+    ("fcfM",               "FCF",                              "млн руб."),
+    ("discountFactor",     "Коэффициент дисконтирования",      "доля"),
+    ("chddM",              "ЧДД",                              "млн руб."),
+    ("cumChddM",           "Накопленный ЧДД",                  "млн руб."),
+    ("startStopCount",     "Количество остановок или запусков", "шт."),
+    ("pumpChanges",        "Количество установленных новых ЭЦН", "шт."),
+    ("initialPumps",       "из них первичных установок",       "шт."),
+    ("conversionCount",    "Количество переводов под закачку", "шт."),
+]
+
+# Синонимы для чтения чужой таблицы: сопоставление идёт по подстроке
+# в нижнем регистре, потому что точных формулировок мы не знаем.
+# (подстрока в названии, требуемая единица или None, ключ).
+# Порядок важен: более специфичные строки идут первыми, иначе
+# «накопленный ЧДД» матчится на «ЧДД», а «остановки и запуски» в
+# миллионах — на счётчик остановок в штуках.
+_ALIASES = [
+    ("накопленный чдд",                 None,  "cumChddM"),
+    ("добыча нефти",                    None,  "oilKt"),
+    ("добыча жидкости",                 None,  "liquidKt"),
+    ("закачка",                         "м3",  "injectionKm3"),
+    # ВАЖНО: их «Средний действующий фонд» = 588 при 49 скважинах, то
+    # есть это СКВАЖИНО-МЕСЯЦЫ (49 x 12), а не среднее число скважин.
+    # Проверяется деньгами: содержание фонда 49 млн за 588 скв.-мес.
+    ("средний действующий фонд",        None,  "activeWellMonths"),
+    ("скважино-мес",                    None,  "activeWellMonths"),
+    ("месяцев в году",                  None,  "months"),
+    ("выручка",                         None,  "revenueM"),
+    ("полный opex",                     None,  "opexM"),
+    ("capex новых",                     None,  "capexM"),
+    ("fcf",                             None,  "fcfM"),
+    ("коэффициент дисконтирован",       None,  "discountFactor"),
+    ("количество остановок",            "шт",  "startStopCount"),
+    ("количество установленных новых",  "шт",  "pumpChanges"),
+    ("количество переводов",            "шт",  "conversionCount"),
+    ("чдд",                             None,  "chddM"),
+]
+
+
+def _norm(s: str) -> str:
+    return " ".join(str(s).lower().replace("\xa0", " ").split())
+
+
+def _num(v) -> float:
+    try:
+        return float(str(v).replace(",", ".").replace(" ", "")
+                     .replace("\xa0", "") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _annual_value(res: "NPVResult", key: str, i: int) -> float | None:
+    """Значение показателя за i-й год. cumChddM считается на лету."""
+    if key == "cumChddM":
+        return sum(float(y.get("chddM", 0) or 0) for y in res.years[:i + 1])
+    v = res.years[i].get(key)
+    return None if v is None else float(v)
+
+
+def write_annual_csv(res: "NPVResult", path: str) -> None:
+    """
+    Годовая таблица в раскладке организаторов: показатель, единица
+    измерения, затем годы столбцами. Разделитель «;», десятичная запятая
+    — Excel открывает без настройки импорта.
+    """
+    years = [int(y["year"]) for y in res.years if y.get("year")]
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["Показатель", "Ед. изм."] + years)
+        for key, label, unit in ANNUAL_ROWS:
+            if key != "cumChddM" and not any(key in y for y in res.years):
+                continue
+            row = [label, unit]
+            for i in range(len(res.years)):
+                v = _annual_value(res, key, i)
+                row.append("" if v is None
+                           else f"{v:.6f}".rstrip("0").rstrip(".").replace(".", ","))
+            w.writerow(row)
+
+
+def read_annual_csv(path: str) -> dict[str, dict[int, float]]:
+    """
+    Чужая годовая таблица -> {ключ: {год: значение}}.
+
+    Ожидается раскладка организаторов: первая колонка — название,
+    вторая может быть единицей измерения, дальше годы. Колонка единиц
+    определяется автоматически по заголовку.
+    """
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        sample = f.read(4096); f.seek(0)
+        delim = ";" if sample.count(";") >= sample.count(",") else ","
+        rows = list(csv.reader(f, delimiter=delim))
+    if not rows:
+        return {}
+
+    # какие колонки заголовка — годы
+    year_of: dict[int, int] = {}
+    for i, cell in enumerate(rows[0]):
+        try:
+            v = int(float(str(cell).strip()))
+        except ValueError:
+            continue
+        if 1900 < v < 2200:
+            year_of[i] = v
+    if not year_of:
+        print("  в заголовке эталона не найдено годов"); return {}
+    unit_col = 1 if "изм" in _norm(rows[0][1] if len(rows[0]) > 1 else "") else None
+
+    out: dict[str, dict[int, float]] = {}
+    unmatched = []
+    for r in rows[1:]:
+        if not r or not str(r[0]).strip():
+            continue
+        name = _norm(r[0])
+        unit = _norm(r[unit_col]) if unit_col is not None and len(r) > unit_col else ""
+        key = None
+        for sub, need_unit, k in _ALIASES:
+            if sub in name and (need_unit is None or need_unit in unit):
+                key = k
+                break
+        if key is None or key in out:
+            if key is None:
+                unmatched.append(str(r[0]).strip()[:38])
+            continue
+        out[key] = {}
+        for i, yr in year_of.items():
+            if i < len(r) and str(r[i]).strip():
+                out[key][yr] = _num(r[i])
+    if unmatched:
+        print(f"  не сопоставлено строк эталона: {len(unmatched)} "
+              f"({', '.join(unmatched[:5])})")
+    return out
+
+
+def compare_annual(res: "NPVResult", ref: dict[str, dict[int, float]],
+                   tol_pct: float = 0.5, only_bad: bool = False) -> int:
+    """
+    Сравнение колонка к колонке: строка эталона, наша строка, расхождение.
+    Возвращает число ячеек, где расхождение больше допуска.
+    """
+    idx = {int(y["year"]): i for i, y in enumerate(res.years) if y.get("year")}
+    ref_years: set[int] = set()
+    for v in ref.values():
+        ref_years |= set(v)
+    years = sorted(set(idx) & ref_years)
+    if not years:
+        print("  нет общих лет для сравнения"); return 1
+
+    W = 32
+    hdr = "показатель".ljust(W) + "ед.".ljust(10) + "".join(f"{y:>11}" for y in years)
+    print("\n" + "=" * len(hdr)); print(hdr); print("-" * len(hdr))
+
+    bad = 0
+    for key, label, unit in ANNUAL_ROWS:
+        if key not in ref:
+            continue
+        o = [(_annual_value(res, key, idx[y]) or 0.0) for y in years]
+        r = [ref[key].get(y, 0.0) for y in years]
+        dl = [((a - b) / b * 100 if b else (0.0 if not a else 100.0))
+              for a, b in zip(o, r)]
+        n_bad = sum(abs(d) > tol_pct for d in dl)
+        bad += n_bad
+        if only_bad and not n_bad:
+            continue
+        mark = " !" if n_bad else ""
+        print(f"{('  эталон · ' + label)[:W]:{W}}{unit[:9]:10}"
+              + "".join(f"{v:>11,.2f}" for v in r))
+        print(f"{'  наш':{W}}{'':10}" + "".join(f"{v:>11,.2f}" for v in o))
+        print(f"{'  расхождение, %' + mark:{W}}{'':10}"
+              + "".join(f"{v:>+11.2f}" for v in dl))
+        print()
+    print("=" * len(hdr))
+    print(f"  ячеек с расхождением больше {tol_pct} %: {bad}")
+    return bad
+
+
+# --------------------------------------------------------------------------
 def compute_npv(records: list[dict[str, Any]],
                 start_year: int | None = None,
                 assumptions: dict[str, Any] | None = None,
@@ -232,13 +431,6 @@ def check_before_compute(records: list[dict[str, Any]]) -> list[str]:
     return problems
 
 
-def _num(v) -> float:
-    try:
-        return float(str(v).replace(",", ".").replace(" ", "") or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
 # --------------------------------------------------------------------------
 def main() -> None:
     import argparse
@@ -250,6 +442,14 @@ def main() -> None:
                         "(эталон организаторов делает именно так: 23 операции "
                         "в 2007 и 28 в 2008 — это ввод скважин)")
     p.add_argument("--json", help="сохранить полную разбивку")
+    p.add_argument("--annual-csv",
+                   help="годовая таблица в раскладке организаторов")
+    p.add_argument("--compare",
+                   help="таблица организаторов для сравнения колонка к колонке")
+    p.add_argument("--compare-tol", type=float, default=0.5,
+                   help="допуск расхождения в процентах, по умолчанию 0.5")
+    p.add_argument("--only-bad", action="store_true",
+                   help="печатать только строки с расхождением выше допуска")
     a = p.parse_args()
 
     print(f"эталон: {CHDD_DIR}  ({VERSION})")
@@ -265,6 +465,16 @@ def main() -> None:
                                assumptions=assumptions)
     print()
     print(res.summary())
+
+    if a.annual_csv:
+        write_annual_csv(res, a.annual_csv)
+        print(f"\nгодовая таблица: {a.annual_csv}")
+
+    if a.compare:
+        ref = read_annual_csv(a.compare)
+        if ref:
+            compare_annual(res, ref, tol_pct=a.compare_tol,
+                           only_bad=a.only_bad)
 
     if a.json:
         Path(a.json).write_text(

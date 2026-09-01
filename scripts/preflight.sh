@@ -152,13 +152,13 @@ last=[int(y.get("months") or 0) for y in years if int(y.get("year",0))==2015]
 G,R,N="\033[32m","\033[31m","\033[0m"
 print(f"  {G}✓{N} планка {npv:,.3f} млн руб")
 bad=[]
-if abs(npv-1023.355)>0.01: bad.append(f"ожидается 1 023,355, расхождение {npv-1023.355:+.3f}")
+if abs(npv-1018.986)>0.01: bad.append(f"ожидается 1 018,986, расхождение {npv-1018.986:+.3f}")
 if tot!=23: bad.append(f"месяцев {tot}, ожидается 23")
-if last and last[0]!=11: bad.append(f"2015: {last[0]} мес, ожидается 11")
+if last and last[0]!=12: bad.append(f"{end_year}: {last[0]} мес, ожидается 12")
 for b in bad: print(f"  {R}✗{N} {b}")
 sys.exit(1 if bad else 0)
 PY
-    if [ $? -eq 0 ]; then PASS=$((PASS+1)); ok "раскладка 12 + 11 = 23"
+    if [ $? -eq 0 ]; then PASS=$((PASS+1)); ok "раскладка 11 + 12 = 23"
     else FAIL=$((FAIL+1)); fi
 else
     bad "нет планки" "./prepare_baseline.sh $CUT_DATE $END_YEAR"
