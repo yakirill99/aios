@@ -23,6 +23,18 @@
 
 4. Скрипт ЧДД ОТКАЗЫВАЕТСЯ считать, если WLPR > 500 м3/сут.
    Проверяем здесь, чтобы не узнать об этом на последнем шаге.
+
+5. МЕТКА ДАТЫ = ДАТА ТОЧКИ СВОДКИ, а не месяц добычи.
+   Разность накопленных в точке 01.02.2014 — это добыча за январь, но
+   организаторы помечают её ФЕВРАЛЁМ. Проверено сверкой годовой добычи
+   с их таблицей: при их разметке расхождение ЧДД 0,08 %, при сдвиге на
+   месяц назад — 0,92 %, а добыча 2007 года расходится на 27 %.
+   Итог по годам при верной разметке:
+       2007  57,4 против 57,296      2015  104,5 против 104,342
+   Разметка влияет не на объёмы, а на разнесение по годам, то есть на
+   дисконтирование: месяц, уехавший из 2015 в 2007, стоит по-разному.
+   Флаг --legacy-labels воспроизводит прежнее поведение для сравнения
+   со старыми прогонами.
 --------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -40,11 +52,17 @@ COLUMNS = ["DATA", "well", "WLPT", "WLPR", "WOMT", "WOMR", "WWIR", "WWIT",
 
 
 def _prev_month(d: date) -> date:
-    """Первое число предыдущего месяца."""
+    """Первое число предыдущего месяца. Только для --legacy-labels."""
     return date(d.year - 1, 12, 1) if d.month == 1 else date(d.year, d.month - 1, 1)
 
 
-def read_summary(path: str, oil_density: float, start: str | None = None):
+def _next_month(d: date) -> date:
+    """Первое число следующего месяца."""
+    return date(d.year + 1, 1, 1) if d.month == 12 else date(d.year, d.month + 1, 1)
+
+
+def read_summary(path: str, oil_density: float, start: str | None = None,
+                 legacy_labels: bool = False):
     from resdata.summary import Summary
 
     s = Summary(path)
@@ -100,12 +118,13 @@ def read_summary(path: str, oil_density: float, start: str | None = None):
             if wlpr[i] > MAX_WLPR:
                 warnings.append(f"{w} {d}: WLPR={wlpr[i]:.1f} > {MAX_WLPR}")
 
+            # Метка — дата точки сводки, как у организаторов. Разность
+            # в точке 01.02 физически относится к январю, но в их таблице
+            # она стоит февралём, и от этого зависит год дисконтирования.
+            label = _prev_month(d) if legacy_labels else date(d.year, d.month, 1)
+
             rows.append({
-                # ВАЖНО: разность в точке T — это добыча за ПРЕДЫДУЩИЙ
-                # месяц (накопленное на 01.02 минус на 01.01 = январь).
-                # Помечаем месяцем добычи, иначе период съезжает на месяц
-                # и декабрь 2015 «появляется», хотя разности для него нет.
-                "DATA": _prev_month(d).isoformat(),
+                "DATA": label.isoformat(),
                 "well": w,
                 "WLPT": round(wlpt[i], 4),
                 "WLPR": round(wlpr[i], 4),
@@ -136,10 +155,16 @@ def read_summary(path: str, oil_density: float, start: str | None = None):
     #
     # Берём ПОСЛЕДНЮЮ точку месяца: накопленные величины на конец месяца —
     # это то, что нужно для разностей.
+    # Точка первого числа — граница месяца, именно её ждёт эталон.
+    # Внутримесячные точки (01.02 и 15.02 при дроблении шага) попадают в
+    # ту же группу, и «последняя выигрывает» смещало бы границу месяца.
     by_key: dict[tuple, dict] = {}
     for r in rows:
-        y, m, _ = r["DATA"].split("-")
-        by_key[(r["well"], y, m)] = r          # последняя перезаписывает
+        y, m, dd = r["DATA"].split("-")
+        key = (r["well"], y, m)
+        prev = by_key.get(key)
+        if prev is None or dd == "01" or prev["DATA"].split("-")[2] != "01":
+            by_key[key] = r
     dropped = len(rows) - len(by_key)
     rows = list(by_key.values())
 
@@ -164,12 +189,17 @@ def read_summary(path: str, oil_density: float, start: str | None = None):
     # остановки и пуска. Раньше их отсев терял 21 событие за 2007 год.
     # Первая точка периода даёт разность за месяц ДО начала управления —
     # это история, в наш расчёт она не входит.
+    # Первая строка периода — это разность за месяц ДО передачи
+    # управления, то есть история. При разметке по точке сводки она
+    # помечена самой датой отсечки, поэтому граница строгая.
     if start_d:
-        before = [r for r in rows if r["DATA"] < start_d.isoformat()]
+        edge = (start_d.isoformat() if legacy_labels
+                else _next_month(start_d).isoformat())
+        before = [r for r in rows if r["DATA"] < edge]
         if before:
-            rows = [r for r in rows if r["DATA"] >= start_d.isoformat()]
-            print(f"  отброшено {len(before)} строк за месяц до начала "
-                  f"управления")
+            rows = [r for r in rows if r["DATA"] >= edge]
+            print(f"  отброшено {len(before)} строк истории "
+                  f"(до {edge})")
 
     if dropped:
         print(f"  свёрнуто внутримесячных точек: {dropped}")
@@ -190,9 +220,16 @@ def main() -> None:
     p.add_argument("--start", help="начальная дата, напр. 2014-01-01")
     p.add_argument("--oil-density", type=float, default=OIL_DENSITY,
                    help=f"т/м3, по умолчанию {OIL_DENSITY}")
+    p.add_argument("--legacy-labels", action="store_true",
+                   help="прежняя разметка со сдвигом на месяц назад: "
+                        "только для сравнения со старыми прогонами")
     a = p.parse_args()
 
-    rows, wells, warnings = read_summary(a.smspec, a.oil_density, a.start)
+    rows, wells, warnings = read_summary(a.smspec, a.oil_density, a.start,
+                                         legacy_labels=a.legacy_labels)
+    if a.legacy_labels:
+        print("  ! РАЗМЕТКА LEGACY: сдвиг на месяц назад, расхождение "
+              "с эталоном вырастет до ~0,9 %")
     if not rows:
         sys.exit("нет строк — проверьте --start и содержимое сводки")
 
