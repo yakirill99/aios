@@ -36,7 +36,7 @@ class LLMClient:
                  cache_dir: str | Path = "~/aios-data/llm_cache",
                  temperature: float = 0.0,
                  timeout: int = 600,
-                 num_predict: int = 768,
+                 num_predict: int = 1536,
                  num_ctx: int = 8192):
         # ПРИОРИТЕТ: явный аргумент > переменная окружения > умолчание.
         # Было наоборот, и окружение молча перебивало флаг --llm live:
@@ -64,7 +64,9 @@ class LLMClient:
         # ещё и грузит веса в память.
         self.timeout = int(os.environ.get("AIOS_LLM_TIMEOUT", timeout))
         # Потолок длины ответа: без него думающая модель уходит в
-        # рассуждение на тысячи токенов.
+        # рассуждение на тысячи токенов. 768 не хватало на схему
+        # аналитика с массивом гипотез — JSON обрывался на середине
+        # строки и разбор падал с EOF while parsing a string.
         self.num_predict = int(os.environ.get("AIOS_LLM_NUM_PREDICT",
                                               num_predict))
         self.num_ctx = int(os.environ.get("AIOS_LLM_NUM_CTX", num_ctx))
