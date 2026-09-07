@@ -78,14 +78,19 @@ class AnalysisReport(BaseModel):
     hypotheses: list[Hypothesis] = Field(description="до пяти гипотез")
 
 
-class Pick(BaseModel):
-    tag: str = Field(description="тег кандидата ТОЧНО из предложенного списка")
-    rationale: str = Field(description="одно предложение, без чисел")
-
-
 class StrategyPlan(BaseModel):
-    """Стратег: какие кандидаты отдать в прогон и в каком порядке."""
-    picks: list[Pick] = Field(description="отобранные кандидаты, лучший первым")
+    """
+    Стратег: какие кандидаты отдать в прогон и в каком порядке.
+
+    Раньше на каждый тег требовалось обоснование, и ответ на 25 позиций
+    не влезал в потолок num_predict: JSON обрывался на середине строки,
+    разбор падал, слой уходил в правила. Теперь список — плоские строки,
+    а обоснование одно на весь отбор.
+    """
+    picks: list[str] = Field(
+        description="теги кандидатов ТОЧНО из списка, лучший первым")
+    reasoning: str = Field(
+        description="одно-два предложения на весь отбор, без чисел")
 
 
 class Verdict(BaseModel):
@@ -115,10 +120,31 @@ _NUM_UNIT = re.compile(
     re.IGNORECASE)
 
 
+# Константы методики — ВХОДНЫЕ данные, а не выдумка модели. Резать их
+# вредно: критик написал «предел обводнённости [значение из расчёта]»
+# вместо 98,5%, и объяснение потеряло смысл.
+_KNOWN_VALUES = (
+    "98,5%", "98.5%", "8360 руб/т", "8 360 руб/т", "100 руб/м3",
+    "100 руб/м³", "500 м3/сут", "500 м³/сут", "50 бар", "300 бар",
+)
+
+
 def scrub(text: str) -> str:
-    """Убирает выдуманные величины из свободного текста."""
-    cleaned = _NUM_UNIT.sub("[значение из расчёта]", text or "")
-    return re.sub(r"\s{2,}", " ", cleaned).strip()
+    """
+    Убирает выдуманные величины из свободного текста, оставляя
+    константы методики нетронутыми.
+    """
+    text = text or ""
+    holes = {}
+    for i, v in enumerate(_KNOWN_VALUES):          # прячем известные
+        if v in text:
+            key = f"\x00{i}\x00"
+            text = text.replace(v, key)
+            holes[key] = v
+    text = _NUM_UNIT.sub("[значение из расчёта]", text)
+    for key, v in holes.items():                   # возвращаем на место
+        text = text.replace(key, v)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 def has_invented_numbers(text: str) -> bool:
@@ -133,12 +159,29 @@ class AgentLayer:
     """
 
     def __init__(self, client: LLMClient | None = None,
-                 trace_path=None):
+                 trace_path=None, warmup: bool = True):
         self.llm = client or LLMClient()
         self.trace_path = trace_path
+        # Первый содержательный вызов иначе платит за загрузку весов и
+        # упирается в тайм-аут, а слой молча уходит на правила.
+        if warmup and self.llm.mode == "live":
+            ok, msg = self.llm.warmup()
+            print(f"  [llm] {msg}")
         self.rejected = 0          # сколько ответов отбраковано валидацией
+        # Кто на самом деле отобрал кандидатов на последнем шаге.
+        # Цикл печатает именно это, а не значение конфигурации: раньше в
+        # логе стояло «(агент)» даже когда роль strategist не вызывалась.
+        self.last_source = "правила"
+        self.llm_steps = 0         # шагов, где отбор сделала модель
+        self.rule_steps = 0        # шагов, где сработали правила
 
     # ------------------------------------------------------------------
+    def status(self) -> str:
+        """Строка для итога прогона: кто реально принимал решения."""
+        return (f"отбор кандидатов: моделью на {self.llm_steps} шагах, "
+                f"правилами на {self.rule_steps}; "
+                f"отброшено несуществующих тегов: {self.rejected}")
+
     def _trace(self, role: str, payload: dict) -> None:
         if not self.trace_path:
             return
@@ -174,6 +217,9 @@ class AgentLayer:
                                 system="Ты инженер-разработчик месторождения.")
         res = res or fallback
         res.summary = scrub(res.summary)
+        # Описание «до трёх» модель не обязана соблюдать: JSON Schema
+        # длину массива не ограничивает. Режем в коде.
+        res.hypotheses = res.hypotheses[:3]
         for h in res.hypotheses:
             h.rationale = scrub(h.rationale)
         self._trace("analyst", {"step": step, "summary": res.summary,
@@ -194,6 +240,7 @@ class AgentLayer:
         подсунуть в расписание величину, которой не было в наборе.
         """
         by_tag = dict(cands)
+        rule_order_pairs = _rule_order_pairs(cands)
         packs = [t for t, _ in cands if t.startswith("PACK")]
         # правиловый порядок: noop, пакеты, остальное — пакеты давали
         # заметно больше одиночных воздействий
@@ -202,7 +249,16 @@ class AgentLayer:
         fallback = [(t, by_tag[t]) for t in rule_order[:limit]]
 
         if self.llm.mode == "off" or len(cands) <= limit:
+            self.last_source = ("правила"
+                                if self.llm.mode == "off"
+                                else "правила (кандидатов не больше лимита)")
+            self.rule_steps += 1
             return fallback
+
+        # У модели спрашиваем короткий список, остальное добираем по
+        # правилам. Просить 25 тегов из 34 бессмысленно: отбора почти нет,
+        # а ответ раздувается и обрывается по потолку токенов.
+        ask_n = min(limit, 12)
 
         prompt = (
             f"{ECONOMIC_CONTEXT}\n"
@@ -211,21 +267,24 @@ class AgentLayer:
             f"Варианты воздействий (тег = скважина_множитель, "
             f"PACK = несколько скважин сразу):\n" +
             "\n".join(f"- {t}: {_describe(acts)}" for t, acts in cands) +
-            f"\n\nПрогон каждого варианта дорог, посчитать можно только {limit}. "
-            f"Отбери {limit} самых перспективных, лучший первым. "
-            f"Теги копируй буквально. Величины не называй."
+            f"\n\nПрогон каждого варианта дорог. Назови {ask_n} самых "
+            f"перспективных тегов, лучший первым, и одно общее обоснование. "
+            f"Теги копируй буквально из списка. Величины не называй."
         )
         plan = self.llm.complete(prompt, StrategyPlan, fallback=None,
                                  system="Ты инженер по оптимизации разработки.")
 
         if plan is None:
-            self._trace("strategist", {"step": step, "used": "fallback"})
+            self.last_source = "правила (модель не ответила)"
+            self.rule_steps += 1
+            self._trace("strategist", {"step": step, "used": "fallback",
+                                       "reason": self.llm.last_error})
             return fallback
 
         # ВАЛИДАЦИЯ: тег обязан быть из входного набора
         picked, unknown = [], []
-        for p in plan.picks:
-            tag = p.tag.strip()
+        for raw in plan.picks:
+            tag = str(raw).strip()
             if tag in by_tag and tag not in [t for t, _ in picked]:
                 picked.append((tag, by_tag[tag]))
             else:
@@ -240,16 +299,32 @@ class AgentLayer:
             picked.insert(0, ("noop", by_tag["noop"]))
 
         if len(picked) < 2:
+            self.last_source = "правила (мало валидных тегов)"
+            self.rule_steps += 1
             self._trace("strategist", {"step": step, "used": "fallback",
                                        "reason": "мало валидных тегов"})
             return fallback
 
+        # Добираем до limit правиловым хвостом: бюджет прогонов всё равно
+        # оплачен, и терять его из-за короткого ответа модели незачем.
+        n_llm = len(picked)
+        chosen_tags = {t for t, _ in picked}
+        for t, acts in rule_order_pairs:
+            if len(picked) >= limit:
+                break
+            if t not in chosen_tags:
+                picked.append((t, acts))
+                chosen_tags.add(t)
+
         picked = picked[:limit]
+        self.last_source = f"агент ({n_llm} из {len(picked)})"
+        self.llm_steps += 1
         self._trace("strategist", {
             "step": step, "used": "llm",
-            "picked": [t for t, _ in picked],
-            "rationale": {p.tag: scrub(p.rationale) for p in plan.picks
-                          if p.tag in by_tag}})
+            "picked_by_llm": [t for t, _ in picked[:n_llm]],
+            "filled_by_rules": len(picked) - n_llm,
+            "rejected_tags": unknown,
+            "reasoning": scrub(plan.reasoning)})
         return picked
 
     # --- РОЛЬ 3: КРИТИК -----------------------------------------------
@@ -306,6 +381,20 @@ _ISSUE_MAP = {"water_breakthrough": "watercut", "unprofitable": "unprofitable",
               "headroom": "headroom", "declining": "decline", "idle": "idle"}
 
 
+def _rule_order_pairs(cands: list[tuple]) -> list[tuple]:
+    """
+    Правиловый порядок: noop, пакеты, одиночные.
+
+    Пакеты вперёд намеренно: одновременные воздействия дают больше
+    растянутых по шагам, потому что дисконт удешевляет позднее действие.
+    При обрезке до K первыми должны выживать они.
+    """
+    noop = [c for c in cands if c[0] == "noop"]
+    packs = [c for c in cands if c[0].startswith("PACK")]
+    rest = [c for c in cands if c[0] != "noop" and not c[0].startswith("PACK")]
+    return noop + packs + rest
+
+
 def _fmt_diag(diag: dict) -> str:
     lines = [f"- {k}: {', '.join(v)}" for k, v in diag.items() if v]
     return "\n".join(lines) or "- отклонений не найдено"
@@ -358,6 +447,7 @@ def _self_test() -> int:
         print(f"   аналитик: {rep_.summary[:76]}")
         picked = ag.rank_candidates(cands, diag, 0, 23, limit=3)
         print(f"   стратег:  {[t for t, _ in picked]}")
+        assert len(picked) == 3, "добор правилами не сработал"
         assert all(t in dict(cands) for t, _ in picked), "выдуманный тег прошёл"
         assert "noop" in [t for t, _ in picked], "noop потерян"
         v = ag.explain("PACK_prod_x1p5", 42.7,

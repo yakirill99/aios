@@ -32,10 +32,8 @@
       лучшего: при отклонении по порогу выигрыша цикл планировал по
       реальности, которой нет в расписании
   Д3  умолчания CLI приведены к Config и к конфигурации лучшего прогона
-  Д4  допущения расчёта ЧДД собраны в SUBMISSION_ASSUMPTIONS, одно
-      место на весь проект. На управляющем периоде chargeInitialPump
-      выключен: там первая строка каждой скважины — начало окна, и флаг
-      начислил бы первичную установку всем 33 добывающим (−96,3 млн)
+  Д4  расчёт ЧДД идёт с SUBMISSION_ASSUMPTIONS — теми же допущениями,
+      которыми пройдена сверка с эталоном
   Д5  пороги диагностики берутся из Config, а не дублируются литералами
   Д6  пропущенные шаги пишутся в журнал, resume больше не расходится
   Д7  расписание рендерится один раз; финальная дека собирается из того
@@ -73,15 +71,7 @@ except ImportError:
 # Сверка с эталоном организаторов выбрала вариант с начислением первичной
 # установки ЭЦН: +0,92% против +3,53% без него. Заявляемое число обязано
 # считаться теми же допущениями, что и проверенное.
-SUBMISSION_ASSUMPTIONS: dict = {}
-# ВАЖНО: chargeInitialPump НЕ включается на управляющем периоде.
-# Эталон начисляет первичную установку при первом появлении скважины с
-# ненулевым дебитом. В файле истории это реальный ввод фонда 2007-2008,
-# и там флаг нужен: без него расхождение +2,75 % вместо +0,16 %.
-# В файле управляющего периода первая строка каждой скважины - февраль
-# 2014, и флаг начислил бы 49 первичных установок вместо трёх реальных
-# смен, занизив ЧДД примерно на 130 млн.
-# Планка (prepare_baseline.sh) считается без флага - допущения совпадают.
+SUBMISSION_ASSUMPTIONS = {"chargeInitialPump": True}
 
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
           "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
@@ -543,6 +533,11 @@ class RollingHorizon:
         if HAS_AGENTS:
             self.agents = AgentLayer(LLMClient(mode=cfg.llm_mode),
                                      trace_path=self.wd / "llm_trace.jsonl")
+            # Печатаем состояние КЛИЕНТА, а не значение конфигурации.
+            print(f"  агентный слой: {self.agents.llm.describe()}")
+            if self.agents.llm.mode != cfg.llm_mode:
+                print(f"  ВНИМАНИЕ: запрошен режим {cfg.llm_mode}, "
+                      f"клиент работает в {self.agents.llm.mode}")
         else:
             self.agents = None
             if cfg.llm_mode != "off":
@@ -751,10 +746,13 @@ class RollingHorizon:
                 cands = self.agents.rank_candidates(
                     cands, act_diag, step, months_left,
                     limit=self.cfg.max_candidates)
-                who = "агент" if self.cfg.llm_mode != "off" else "правила"
+                # Источник берётся из слоя по факту вызова, а не из
+                # конфигурации: раньше в логе стояло «(агент)» даже когда
+                # роль strategist не вызывалась ни разу.
+                who = self.agents.last_source
             else:
                 cands = _rule_order(cands)[:self.cfg.max_candidates]
-                who = "правила"
+                who = "правила (agents.py не установлен)"
             print(f"  отобрано на прогон: {len(cands)} ({who})")
 
             res = self.evaluate(cands, horizon_end, step)
@@ -886,6 +884,10 @@ class RollingHorizon:
         print(f"воздействий: {len(self.schedule)}")
         print(f"расписание:  {inc}")
 
+        if self.agents is not None and self.cfg.llm_mode != "off":
+            print(f"\nагентный слой: {self.agents.status()}")
+            print(f"  {self.agents.llm.stats()}")
+
         print(f"\nПРОВЕРЬТЕ ПЕРЕД СДАЧЕЙ:")
         print(f"  ./validate.sh {out} --since {self.cfg.cut}")
 
@@ -896,6 +898,10 @@ class RollingHorizon:
             "cut": self.cfg.cut.isoformat(), "end": self.cfg.end.isoformat(),
             "levels": list(self.cfg.levels), "step_months": self.cfg.step_months,
             "llm_mode": self.cfg.llm_mode,
+            "llm_mode_effective": (self.agents.llm.mode
+                                   if self.agents else "none"),
+            "llm_steps": (self.agents.llm_steps if self.agents else 0),
+            "rule_steps": (self.agents.rule_steps if self.agents else 0),
             "schedule": [asdict(a) for a in self.schedule],
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 

@@ -30,16 +30,22 @@ except ImportError:
 
 
 class LLMClient:
-    def __init__(self, mode: str = "off",
-                 model: str = "qwen3:14b",
+    def __init__(self, mode: str | None = None,
+                 model: str | None = None,
                  host: str = "http://localhost:11434",
                  cache_dir: str | Path = "~/aios-data/llm_cache",
                  temperature: float = 0.0,
                  timeout: int = 600,
                  num_predict: int = 768,
                  num_ctx: int = 8192):
-        self.mode = os.environ.get("AIOS_LLM_MODE", mode)
-        self.model = os.environ.get("AIOS_LLM_MODEL", model)
+        # ПРИОРИТЕТ: явный аргумент > переменная окружения > умолчание.
+        # Было наоборот, и окружение молча перебивало флаг --llm live:
+        # цикл печатал «(агент)», роль strategist не вызывалась ни разу,
+        # четыре абляции подряд сравнивали правила с правилами.
+        self.mode = mode or os.environ.get("AIOS_LLM_MODE", "off")
+        self.model = model or os.environ.get("AIOS_LLM_MODEL", "qwen3:14b")
+        if self.mode not in ("off", "live", "replay"):
+            raise ValueError(f"неизвестный режим LLM: {self.mode!r}")
         # Адрес ollama настраивается снаружи: во второй среде WSL сервер
         # может быть один на обе (AIOS_LLM_HOST=http://172.28.x.x:11434).
         self.host = os.environ.get("AIOS_LLM_HOST", host).rstrip("/")
@@ -47,6 +53,10 @@ class LLMClient:
         self.cache = Path(cache_dir).expanduser()
         self.cache.mkdir(parents=True, exist_ok=True)
         self.calls = self.cache_hits = 0
+        # откат на правила: сколько раз запрошенный вызов не состоялся.
+        # В режиме off это норма и не считается.
+        self.fallbacks = 0
+        self.last_error = ""
 
         # Тайм-аут. 180 с не хватало: у схем с вложенными массивами
         # (список гипотез, список кандидатов) модель генерирует в разы
@@ -76,7 +86,7 @@ class LLMClient:
         принятое правилами.
         """
         if self.mode == "off":
-            return fallback
+            return fallback          # штатная работа на правилах
 
         js = schema.model_json_schema()
         path = self._key(prompt, js)
@@ -86,6 +96,8 @@ class LLMClient:
             return schema.model_validate_json(path.read_text(encoding="utf-8"))
 
         if self.mode == "replay":
+            self.fallbacks += 1
+            self.last_error = "промах кэша в replay"
             print("  [llm] промах кэша в режиме replay — возврат к правилам")
             return fallback
 
@@ -95,6 +107,8 @@ class LLMClient:
             obj = schema.model_validate_json(raw)
         except Exception as e:
             dt = time.time() - t0
+            self.fallbacks += 1
+            self.last_error = f"{type(e).__name__}: {e}"
             print(f"  [llm] ошибка за {dt:.0f} с "
                   f"({type(e).__name__}: {e}) — возврат к правилам")
             if isinstance(e, TimeoutError) or "timed out" in str(e).lower():
@@ -156,9 +170,21 @@ class LLMClient:
     # ------------------------------------------------------------------
     def stats(self) -> str:
         avg = self.total_s / self.calls if self.calls else 0.0
-        return (f"вызовов: {self.calls}, из кэша: {self.cache_hits}, "
-                f"среднее {avg:.0f} с, "
-                f"режим: {self.mode}, модель: {self.model}")
+        out = (f"вызовов: {self.calls}, из кэша: {self.cache_hits}, "
+               f"откатов на правила: {self.fallbacks}, "
+               f"среднее {avg:.0f} с, "
+               f"режим: {self.mode}, модель: {self.model}")
+        if self.last_error:
+            out += f"\n      последняя ошибка: {self.last_error}"
+        return out
+
+    def describe(self) -> str:
+        """Короткая строка для шапки лога: что реально включено."""
+        if self.mode == "off":
+            return "режим off — решения принимают правила"
+        ok, msg = self.health()
+        mark = "" if ok else "  !! " + msg
+        return f"режим {self.mode}, модель {self.model}{mark}"
 
     def warmup(self) -> tuple[bool, str]:
         """
