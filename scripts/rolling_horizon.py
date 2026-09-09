@@ -32,8 +32,10 @@
       лучшего: при отклонении по порогу выигрыша цикл планировал по
       реальности, которой нет в расписании
   Д3  умолчания CLI приведены к Config и к конфигурации лучшего прогона
-  Д4  расчёт ЧДД идёт с SUBMISSION_ASSUMPTIONS — теми же допущениями,
-      которыми пройдена сверка с эталоном
+  Д4  допущения расчёта собраны в SUBMISSION_ASSUMPTIONS, одно место на
+      весь проект. На управляющем окне chargeInitialPump выключен: там
+      первая строка каждой скважины — начало окна, и флаг начислил бы
+      первичную установку всем 33 добывающим (минус 96,3 млн)
   Д5  пороги диагностики берутся из Config, а не дублируются литералами
   Д6  пропущенные шаги пишутся в журнал, resume больше не расходится
   Д7  расписание рендерится один раз; финальная дека собирается из того
@@ -44,6 +46,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -79,7 +82,15 @@ except ImportError:
 # Сверка с эталоном организаторов выбрала вариант с начислением первичной
 # установки ЭЦН: +0,92% против +3,53% без него. Заявляемое число обязано
 # считаться теми же допущениями, что и проверенное.
-SUBMISSION_ASSUMPTIONS = {"chargeInitialPump": True}
+SUBMISSION_ASSUMPTIONS: dict = {}
+# ВАЖНО: chargeInitialPump НЕ включается на управляющем периоде.
+# Эталон начисляет первичную установку при первом появлении скважины с
+# ненулевым дебитом. В файле истории это реальный ввод фонда 2007-2008,
+# и там флаг нужен: без него расхождение +2,75 % вместо +0,16 %.
+# В файле управляющего периода первая строка каждой скважины — февраль
+# 2014, и флаг начисляет первичную установку всем 33 добывающим,
+# занижая ЧДД на 96,3 млн: планка 922,7 вместо 1 018,986.
+# prepare_baseline.sh считает без флага — допущения обязаны совпадать.
 
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
           "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
@@ -133,6 +144,7 @@ class Config:
     llm_mode: str = "off"               # off | live | replay
     constraints_path: str = ""          # configs/constraints.yaml
     events_path: str = ""               # файл недоступности скважин
+    external_path: str = ""             # файл ограничений организаторов
 
 
 @dataclass
@@ -151,6 +163,11 @@ class StepRecord:
     analyst_summary: str = ""
     explanation: str = ""
     risk: str = ""
+    # ЧДД каждого посчитанного кандидата. Раньше журнал хранил только
+    # победителя, и разобраться, почему выигрыш вышел ровно нулевым,
+    # было нечем: деки шагов удаляются по ходу прогона.
+    npv_by_tag: dict = field(default_factory=dict)
+    rejected_by_limits: list = field(default_factory=list)
 
 
 # ==========================================================================
@@ -538,6 +555,66 @@ def load_matrix_lags(path: Path) -> dict[str, list[int]]:
     return out
 
 
+def _by_well_round_robin(items: list[tuple]) -> list[tuple]:
+    """
+    Одиночные кандидаты вперемешку по скважинам, а не лестницей.
+
+    Кандидаты генерируются по целям подряд: пять уровней первой скважины,
+    потом пять уровней второй. При малом лимите отбора все слоты уходили
+    на первую скважину — при лимите 8 оценивались noop, три пакета и
+    четыре уровня ОДНОЙ скважины, а остальные цели не проверялись ни разу.
+    Причём первой в списке обычно стоит самая проблемная скважина, которая
+    чаще всего упирается в предел отдачи и даёт нулевой отклик.
+
+    Здесь порядок разворачивается по кругу: по одному уровню на каждую
+    скважину, затем второй уровень, и так далее. При любом лимите
+    охватывается максимум разных скважин.
+    """
+    def level_of(tag: str) -> float:
+        m = re.search(r"_x(\d+)(?:p(\d+))?$", tag)
+        if not m:
+            return 1.0
+        return float(f"{m.group(1)}.{m.group(2) or '0'}")
+
+    def priority(item: tuple) -> float:
+        """
+        Порядок уровней внутри скважины.
+
+        Сетка задана как 0.7, 1.25, ... — то есть первым генерируется
+        СНИЖЕНИЕ. При переборе по кругу это означало, что первый круг
+        целиком уходил на снижение отбора, хотя главный рычаг —
+        форсирование, и все победители прогонов это подтверждают.
+
+        Для добывающих сначала идёт умеренное повышение, затем сильное,
+        затем снижение. Для нагнетательных наоборот: там выигрывает
+        снижение бесполезной закачки.
+        """
+        tag, acts = item
+        lv = level_of(tag)
+        inj = bool(acts) and getattr(acts[0], "control", "") == "RATE"
+        if inj:
+            return (lv, )                      # от меньшего к большему
+        # Для добывающих порядок ОБРАТНЫЙ: сильное форсирование первым.
+        # При малом лимите до второго круга дело не доходит, а все
+        # победители прогонов были высокими уровнями: x3 четырежды,
+        # x2.25 однажды. Начинать с x1.25 значит проверять самый слабый
+        # вариант и не увидеть настоящий выигрыш.
+        return (99.0 if lv < 1 else -lv, )      # снижение — в конец
+
+    by_well: dict[str, list[tuple]] = {}
+    for tag, acts in items:
+        key = acts[0].well if acts else tag
+        by_well.setdefault(str(key), []).append((tag, acts))
+    for w in by_well:
+        by_well[w].sort(key=priority)
+    out: list[tuple] = []
+    while any(by_well.values()):
+        for w in list(by_well):
+            if by_well[w]:
+                out.append(by_well[w].pop(0))
+    return out
+
+
 def _rule_order(cands: list[tuple]) -> list[tuple]:
     """
     Правиловый порядок кандидатов: noop, пакеты, одиночные.
@@ -549,7 +626,7 @@ def _rule_order(cands: list[tuple]) -> list[tuple]:
     noop = [c for c in cands if c[0] == "noop"]
     packs = [c for c in cands if c[0].startswith("PACK")]
     rest = [c for c in cands if c[0] != "noop" and not c[0].startswith("PACK")]
-    return noop + packs + rest
+    return noop + packs + _by_well_round_robin(rest)
 
 
 def useful_degree(lags: dict[str, list[int]], well: str,
@@ -595,6 +672,9 @@ class RollingHorizon:
             if cfg.events_path:
                 k = self.limits.load_events(cfg.events_path)
                 print(f"  ограничений по времени: {k}")
+            if cfg.external_path:
+                from constraints import apply_external
+                apply_external(self.limits, cfg.external_path)
             act = [x for x in (self.limits.max_total_liquid_rate,
                                self.limits.max_total_injection_rate,
                                self.limits.max_total_oil_period,
@@ -761,7 +841,26 @@ class RollingHorizon:
                 sys.exit("опорный прогон не удался")
             self.states = read_state(self.runner, next(out.glob("*.SMSPEC")), self.cfg.cut)
             npv0 = self.runner.npv(out, self.cfg.cut)
-            print(f"  ЧДД без вмешательств: {npv0:,.1f} млн руб\n")
+            print(f"  ЧДД без вмешательств: {npv0:,.1f} млн руб")
+
+            # Сверка с планкой prepare_baseline.sh. Расхождение означает
+            # разные допущения расчёта — именно так один прогон вышел с
+            # планкой 922,7 вместо 1 019,0 и завышенным приростом.
+            bj = (Path(os.environ.get("DATA_ROOT", "~/aios-data")).expanduser()
+                  / "runs" / "baseline" / "baseline_npv.json")
+            if bj.exists():
+                try:
+                    ref = json.loads(bj.read_text(encoding="utf-8"))["npv_mln_rub"]
+                    d = npv0 - ref
+                    if abs(d) > 0.5:
+                        print(f"  ВНИМАНИЕ: у prepare_baseline {ref:,.1f} млн, "
+                              f"расхождение {d:+,.1f} — проверьте "
+                              f"SUBMISSION_ASSUMPTIONS")
+                    else:
+                        print(f"  совпадает с prepare_baseline ({ref:,.1f})")
+                except Exception:
+                    pass
+            print()
             self.baseline = npv0
         else:
             self.baseline = self.journal[0].npv_noop
@@ -840,8 +939,9 @@ class RollingHorizon:
             print(f"  кандидатов сгенерировано: {len(cands)}")
 
             # Отбраковка по внешним ограничениям с записью причины.
+            dropped: list = []
             if self.limits is not None:
-                kept, dropped = [], []
+                kept = []
                 for tag, acts in cands:
                     bad = self.limits.check_actions(acts, horizon_end)
                     errs = [i for i in bad if i.severity == "error"]
@@ -947,7 +1047,9 @@ class RollingHorizon:
                 npv_window=best_npv, npv_noop=noop_npv, gain=gain,
                 n_candidates=len(cands), duration_s=time.time() - t0,
                 diagnosis=act_diag, analyst_summary=analyst,
-                explanation=explanation, risk=risk))
+                explanation=explanation, risk=risk,
+                npv_by_tag={k: round(v, 3) for k, v in res.items()},
+                rejected_by_limits=[t for t, _ in dropped] if self.limits else []))
             self.save()
 
             # чистим пробные прогоны шага, оставляем зачётный
@@ -1067,6 +1169,8 @@ def main() -> None:
                    help="путь к configs/constraints.yaml")
     p.add_argument("--events", default="",
                    help="файл недоступности скважин (ремонты по датам)")
+    p.add_argument("--external", default="",
+                   help="файл ограничений организаторов (валидационный кейс)")
     a = p.parse_args()
 
     cfg = Config(
@@ -1081,7 +1185,8 @@ def main() -> None:
         trig_min_gain_mln=a.min_gain,
         llm_mode=a.llm,
         constraints_path=a.constraints,
-        events_path=a.events)
+        events_path=a.events,
+        external_path=a.external)
 
     rh = RollingHorizon(cfg, Path(a.matrix).expanduser() if a.matrix else None)
 

@@ -366,6 +366,8 @@ def main() -> None:
                    help="путь к configs/constraints.yaml")
     p.add_argument("--events",
                    help="файл недоступности скважин: скважина, начало, конец")
+    p.add_argument("--external",
+                   help="файл ограничений организаторов (валидационный кейс)")
     p.add_argument("--comp-hard", action="store_true",
                    help="считать нарушение компенсации ошибкой, а не "
                         "предупреждением")
@@ -375,6 +377,9 @@ def main() -> None:
     if limits and a.events:
         n = limits.load_events(a.events)
         print(f"  загружено ограничений по времени: {n}")
+    if limits and a.external:
+        from constraints import apply_external
+        apply_external(limits, a.external)
     if limits:
         active = [x for x in (limits.max_total_liquid_rate,
                               limits.max_total_injection_rate,

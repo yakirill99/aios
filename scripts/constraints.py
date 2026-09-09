@@ -413,6 +413,185 @@ def _as_date(v) -> date:
 
 
 # ==========================================================================
+# ПАРСЕР ВНЕШНЕГО ФАЙЛА ОГРАНИЧЕНИЙ
+#
+# Формат организаторами не показан и будет известен примерно за час до
+# сдачи. Поэтому парсер устроен терпимо: он не требует конкретной
+# структуры, а ищет знакомые сущности в любом текстовом виде —
+# таблица, пары «ключ: значение», связный текст. Всё нераспознанное
+# печатается списком, чтобы за оставшийся час дописать одно правило,
+# а не писать парсер с нуля.
+#
+# Понимает:
+#   таблица         42; 2014-04-01; 2014-06-30; ремонт
+#   пары            max_total_liquid: 3000
+#                   Квота на добычу нефти: 200 тыс. т
+#   связный текст   Скважина 42 остановлена на ремонт с 01.04.2014 по 30.06.2014
+#   даты            2014-04-01, 01.04.2014, 01/04/2014
+# ==========================================================================
+_DATE_RE = r"(\d{4}-\d{2}-\d{2}|\d{2}[./]\d{2}[./]\d{4})"
+
+# (регулярное выражение, поле Constraints, множитель к значению)
+_LIMIT_PATTERNS = [
+    (r"(?:макс\w*\s+)?(?:суммарн\w*\s+)?(?:отбор|добыч\w*)\s+жидкост\w*",
+     "max_total_liquid_rate", 1.0),
+    (r"max[_ ]?total[_ ]?liquid(?:[_ ]?rate)?", "max_total_liquid_rate", 1.0),
+    (r"(?:макс\w*\s+)?(?:суммарн\w*\s+)?закачк\w*", 
+     "max_total_injection_rate", 1.0),
+    (r"max[_ ]?total[_ ]?injection(?:[_ ]?rate)?",
+     "max_total_injection_rate", 1.0),
+    (r"квот\w*\s+(?:на\s+)?(?:добыч\w*\s+)?нефт\w*", "max_total_oil_period", 1.0),
+    (r"max[_ ]?total[_ ]?oil", "max_total_oil_period", 1.0),
+    (r"(?:макс\w*\s+)?(?:числ\w*|количеств\w*)\s+воздействи\w*",
+     "max_actions_per_step", 1.0),
+    (r"max[_ ]?actions[_ ]?per[_ ]?step", "max_actions_per_step", 1.0),
+    (r"деби\w*\s+жидкост\w*\s+(?:по\s+)?скважин\w*", "max_liquid_rate", 1.0),
+    (r"max[_ ]?liquid[_ ]?rate", "max_liquid_rate", 1.0),
+    (r"забойн\w*[^:]*добывающ\w*", "min_bhp_producer", 1.0),
+    (r"min[_ ]?bhp[_ ]?prod\w*", "min_bhp_producer", 1.0),
+    (r"забойн\w*[^:]*нагнетательн\w*", "max_bhp_injector", 1.0),
+    (r"max[_ ]?bhp[_ ]?inj\w*", "max_bhp_injector", 1.0),
+]
+
+_STOP_WORDS = r"(?:ремонт|останов\w*|недоступ\w*|простой|workover|shut\w*|"     r"замен\w*|обслуживани\w*)"
+
+
+def _to_date(s: str) -> date | None:
+    s = s.strip()
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        pass
+    m = re.match(r"^(\d{2})[./](\d{2})[./](\d{4})$", s)
+    if m:
+        d, mo, y = m.groups()
+        try:
+            return date(int(y), int(mo), int(d))
+        except ValueError:
+            return None
+    return None
+
+
+def _to_number(s: str) -> float | None:
+    m = re.search(r"[-+]?\d[\d\s ]*(?:[.,]\d+)?", s)
+    if not m:
+        return None
+    txt = m.group(0).replace(" ", "").replace("\u00a0", "").replace(",", ".")
+    try:
+        return float(txt)
+    except ValueError:
+        return None
+
+
+@dataclass
+class ParseReport:
+    limits: dict = dc_field(default_factory=dict)
+    unavailable: list = dc_field(default_factory=list)
+    unrecognized: list = dc_field(default_factory=list)
+    lines_total: int = 0
+
+    def summary(self) -> str:
+        out = [f"строк прочитано: {self.lines_total}"]
+        if self.limits:
+            out.append("распознанные лимиты:")
+            for k, v in self.limits.items():
+                out.append(f"  {k} = {v}")
+        else:
+            out.append("лимитов не распознано")
+        if self.unavailable:
+            out.append(f"недоступность скважин: {len(self.unavailable)}")
+            for u in self.unavailable[:8]:
+                out.append(f"  {u}")
+        if self.unrecognized:
+            out.append(f"НЕ РАСПОЗНАНО строк: {len(self.unrecognized)}")
+            for line in self.unrecognized[:10]:
+                out.append(f"  ? {line}")
+            out.append("  дописать правило в _LIMIT_PATTERNS или _STOP_WORDS")
+        return "\n".join(out)
+
+
+def parse_external(path: str | Path) -> ParseReport:
+    """
+    Разбирает файл ограничений неизвестной структуры.
+    Ничего не применяет — только сообщает, что понято.
+    """
+    rep = ParseReport()
+    text = Path(path).read_text(encoding="utf-8", errors="ignore")
+
+    for raw in text.splitlines():
+        line = raw.split("#")[0].split("--")[0].strip()
+        if not line:
+            continue
+        rep.lines_total += 1
+        if _try_unavailable(line, rep) or _try_limit(line, rep):
+            continue
+        # секции и заголовки без значений не считаем ошибкой
+        if line.endswith(":") or re.match(r"^[\[<].*[\]>]$", line):
+            continue
+        # Заголовок таблицы и строка без единой цифры — не ограничение.
+        if not re.search(r"\\d", line):
+            continue
+        rep.unrecognized.append(line[:70])
+    return rep
+
+
+def _try_unavailable(line: str, rep: ParseReport) -> bool:
+    """Ремонты: и табличной строкой, и связным текстом."""
+    dates = re.findall(_DATE_RE, line)
+    if len(dates) < 2:
+        return False
+    a, b = _to_date(dates[0]), _to_date(dates[1])
+    if not a or not b:
+        return False
+
+    # номер скважины: явное упоминание либо первое число строки
+    m = re.search(r"(?:скв\w*|well)[\s.№:]*([A-Za-z0-9_-]+)", line, re.I)
+    if m:
+        well = m.group(1)
+    else:
+        head = re.split(r"[;\t,]|\s{2,}", line.strip())[0].strip()
+        if not re.match(r"^[A-Za-z0-9_-]+$", head):
+            return False
+        well = head
+
+    reason = "недоступна"
+    m = re.search(_STOP_WORDS, line, re.I)
+    if m:
+        reason = m.group(0).lower()
+    rep.unavailable.append(Unavailability(str(well), min(a, b), max(a, b), reason))
+    return True
+
+
+def _try_limit(line: str, rep: ParseReport) -> bool:
+    key_part, sep, val_part = line.partition(":")
+    if not sep:
+        # «максимальный отбор жидкости 3000 м3/сут» — без двоеточия
+        key_part, val_part = line, line
+    val = _to_number(val_part)
+    if val is None:
+        return False
+    for pattern, field_name, mult in _LIMIT_PATTERNS:
+        if re.search(pattern, key_part, re.I):
+            rep.limits[field_name] = (int(val) if field_name.startswith("max_actions")
+                                      else val * mult)
+            return True
+    return False
+
+
+def apply_external(c: "Constraints", path: str | Path,
+                   verbose: bool = True) -> ParseReport:
+    """Разбирает файл и применяет распознанное к набору ограничений."""
+    rep = parse_external(path)
+    for k, v in rep.limits.items():
+        setattr(c, k, v)
+    c.unavailable.extend(rep.unavailable)
+    c.source = f"{c.source} + {path}"
+    if verbose:
+        print(rep.summary())
+    return rep
+
+
+# ==========================================================================
 def _self_test() -> int:
     from datetime import date as D
 
@@ -466,4 +645,11 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
         sys.exit(_self_test())
+    if len(sys.argv) > 2 and sys.argv[1] == "--external":
+        c = Constraints.load()
+        print("=" * 62)
+        r = apply_external(c, sys.argv[2])
+        print("=" * 62)
+        print(c.describe())
+        sys.exit(1 if r.unrecognized else 0)
     print(Constraints.load().describe())
