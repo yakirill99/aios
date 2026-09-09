@@ -193,6 +193,7 @@ run_py() {
     local script="$1" out_dir="$2"; shift 2
     docker run --rm -i $USERFLAG -e HOME=/tmp \
         -v "$out_dir":/out -v "$SCRIPT_DIR":/scripts:ro \
+        -v "$AIOS_ROOT/configs":/configs:ro \
         "$IMAGE" python3 "/scripts/$script" "$@"
 }
 

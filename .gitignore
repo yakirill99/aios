@@ -35,3 +35,6 @@ vendor/model/*/USER/
 *.csv
 .lock
 *.tar.gz
+*.bak
+*.py.bak
+*.sh.bak

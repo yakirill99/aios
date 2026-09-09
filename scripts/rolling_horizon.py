@@ -59,6 +59,14 @@ from probe_wells import WellMode, parse_schedule                     # noqa
 from schedule_builder import (Action, ScheduleBuilder, build_deck,    # noqa
                               MAX_LIQUID_RATE)
 
+# Внешние ограничения. Без модуля цикл работает как раньше, на
+# зашитых пределах уровня скважины.
+try:
+    from constraints import Constraints
+    HAS_CONSTRAINTS = True
+except ImportError:
+    HAS_CONSTRAINTS = False
+
 # Агентный слой необязателен: без него цикл работает на правилах.
 try:
     from agents import AgentLayer
@@ -123,6 +131,8 @@ class Config:
     image: str = "aios/opm:2026.04"
     mem_limit_gb: int = 4
     llm_mode: str = "off"               # off | live | replay
+    constraints_path: str = ""          # configs/constraints.yaml
+    events_path: str = ""               # файл недоступности скважин
 
 
 @dataclass
@@ -462,6 +472,50 @@ def add_months(d: date, n: int) -> date:
     return date(d.year + m // 12, m % 12 + 1, 1)
 
 
+def load_matrix_links(path: Path, top: int = 3) -> dict[str, list[dict]]:
+    """
+    Связи между скважинами для промпта стратега.
+
+    Матрица построена возмущающими прогонами и уже используется кодом при
+    отборе целей, но агент её не видел и выбирал вслепую. Здесь она
+    разворачивается в связи по каждому источнику: на кого влияет, через
+    сколько месяцев приходит отклик, в какую сторону.
+
+    Числа тут измеренные, а не выдуманные моделью: это входные данные
+    того же рода, что экономические нормативы.
+    """
+    if not path or not Path(path).exists():
+        return {}
+    import csv
+    raw: dict[str, list[dict]] = {}
+    for r in csv.DictReader(Path(path).open(encoding="utf-8-sig")):
+        if r.get("metric") != "oil":
+            continue
+        try:
+            src = str(r["source"])
+            link = {"observed": str(r["observed"]),
+                    "lag": int(r.get("lag_month", 0)),
+                    "sign": str(r.get("sign", "")).strip(),
+                    "strength": abs(float(r.get("peak_rel", 0) or 0))}
+        except (ValueError, KeyError):
+            continue
+        if link["observed"] == src:
+            continue                       # связь скважины с самой собой
+        raw.setdefault(src, []).append(link)
+
+    out: dict[str, list[dict]] = {}
+    for src, links in raw.items():
+        # одна пара встречается на разных уровнях возмущения:
+        # оставляем самую сильную по каждой наблюдаемой скважине
+        best: dict[str, dict] = {}
+        for l in links:
+            cur = best.get(l["observed"])
+            if cur is None or l["strength"] > cur["strength"]:
+                best[l["observed"]] = l
+        out[src] = sorted(best.values(), key=lambda l: -l["strength"])[:top]
+    return out
+
+
 def load_matrix_lags(path: Path) -> dict[str, list[int]]:
     """
     Лаги откликов по каждому источнику. Фильтрация НЕ статическая:
@@ -511,11 +565,17 @@ class RollingHorizon:
         self.schedule: list[Action] = []
         self.journal: list[StepRecord] = []
         self.lags = load_matrix_lags(matrix) if matrix else {}
+        # Те же данные, развёрнутые в связи: кто на кого влияет и с каким
+        # лагом. Нужны стратегу — раньше он отбирал кандидатов, не зная,
+        # какие скважины связаны между собой.
+        self.links = load_matrix_links(matrix) if matrix else {}
         if self.lags:
             allv = [l for v in self.lags.values() for l in v]
             allv.sort()
+            n_links = sum(len(v) for v in self.links.values())
             print(f"  матрица: {len(self.lags)} источников, "
-                  f"медиана лага {allv[len(allv)//2]} мес")
+                  f"медиана лага {allv[len(allv)//2]} мес, "
+                  f"связей для агента {n_links}")
         self.states: dict[str, WellState] = {}
 
         sch = next(cfg.base.glob("INCLUDE/*sch*.inc"), None)
@@ -528,11 +588,40 @@ class RollingHorizon:
         self.jpath = self.wd / "journal.json"
         self.lock = self.wd / ".lock"
 
+        # Внешние ограничения: квоты по фонду, недоступность скважин.
+        self.limits = None
+        if HAS_CONSTRAINTS:
+            self.limits = Constraints.load(cfg.constraints_path or None)
+            if cfg.events_path:
+                k = self.limits.load_events(cfg.events_path)
+                print(f"  ограничений по времени: {k}")
+            act = [x for x in (self.limits.max_total_liquid_rate,
+                               self.limits.max_total_injection_rate,
+                               self.limits.max_total_oil_period,
+                               self.limits.max_actions_per_step)
+                   if x is not None]
+            print(f"  ограничения: {self.limits.source}, "
+                  f"групповых задано {len(act)}, "
+                  f"недоступностей {len(self.limits.unavailable)}")
+
         # Агентный слой. В режиме off все роли возвращают правиловый
         # результат, цикл считает ровно то же, что и без него.
         if HAS_AGENTS:
             self.agents = AgentLayer(LLMClient(mode=cfg.llm_mode),
                                      trace_path=self.wd / "llm_trace.jsonl")
+            # Пороги из конфигурации — не выдумка модели: разрешаем их
+            # в свободном тексте, иначе объяснения теряют смысл.
+            try:
+                from agents import add_known_values
+                add_known_values(
+                    f"{cfg.trig_watercut * 100:.1f}%".replace(".", ","),
+                    f"{cfg.trig_decline * 100:.0f}%",
+                    f"{self.limits.economic_watercut_limit * 100:.1f}%"
+                    .replace(".", ",") if self.limits else "",
+                    f"{self.limits.max_liquid_rate:.0f} м3/сут"
+                    if self.limits else "")
+            except ImportError:
+                pass
             # Печатаем состояние КЛИЕНТА, а не значение конфигурации.
             print(f"  агентный слой: {self.agents.llm.describe()}")
             if self.agents.llm.mode != cfg.llm_mode:
@@ -726,6 +815,17 @@ class RollingHorizon:
 
             targets = pick_targets(self.states, diag, step, self.cfg,
                                    self.lags, months_left)
+
+            # Скважина в ремонте не должна попадать в рассмотрение: без
+            # этого система продолжала бы предлагать по ней воздействия,
+            # не зная о недоступности.
+            if self.limits is not None and self.limits.unavailable:
+                before = list(targets)
+                targets = [t for t in targets
+                           if self.limits.is_available(str(t), cur)]
+                skipped = [t for t in before if t not in targets]
+                if skipped:
+                    print(f"  недоступны на {cur}: {', '.join(map(str, skipped))}")
             if not targets:
                 # Д6. Пропуск тоже пишется в журнал: иначе resume пройдёт
                 # шаг заново, но уже с другим состоянием, и цикл перестанет
@@ -739,13 +839,28 @@ class RollingHorizon:
             cands = make_candidates(targets, cur, self.cfg)
             print(f"  кандидатов сгенерировано: {len(cands)}")
 
+            # Отбраковка по внешним ограничениям с записью причины.
+            if self.limits is not None:
+                kept, dropped = [], []
+                for tag, acts in cands:
+                    bad = self.limits.check_actions(acts, horizon_end)
+                    errs = [i for i in bad if i.severity == "error"]
+                    if errs and tag != "noop":
+                        dropped.append((tag, errs[0].message))
+                    else:
+                        kept.append((tag, acts))
+                if dropped:
+                    print(f"  отбраковано ограничениями: {len(dropped)}"
+                          f"  ({dropped[0][0]}: {dropped[0][1]})")
+                    cands = kept
+
             # Д1. Отбор до max_candidates происходит ЗДЕСЬ, после
             # ранжирования. В режиме off порядок правиловый:
             # noop, пакеты, одиночные — пакеты больше не отрезаются.
             if self.agents is not None:
                 cands = self.agents.rank_candidates(
                     cands, act_diag, step, months_left,
-                    limit=self.cfg.max_candidates)
+                    limit=self.cfg.max_candidates, links=self.links)
                 # Источник берётся из слоя по факту вызова, а не из
                 # конфигурации: раньше в логе стояло «(агент)» даже когда
                 # роль strategist не вызывалась ни разу.
@@ -948,6 +1063,10 @@ def main() -> None:
                    default=str(DATA_ROOT / "probes/response_matrix.csv"))
     p.add_argument("--llm", default="off", choices=["off", "live", "replay"],
                    help="режим агентного слоя")
+    p.add_argument("--constraints", default="",
+                   help="путь к configs/constraints.yaml")
+    p.add_argument("--events", default="",
+                   help="файл недоступности скважин (ремонты по датам)")
     a = p.parse_args()
 
     cfg = Config(
@@ -960,7 +1079,9 @@ def main() -> None:
         parallel=a.parallel,
         use_triggers=not a.no_triggers,
         trig_min_gain_mln=a.min_gain,
-        llm_mode=a.llm)
+        llm_mode=a.llm,
+        constraints_path=a.constraints,
+        events_path=a.events)
 
     rh = RollingHorizon(cfg, Path(a.matrix).expanduser() if a.matrix else None)
 

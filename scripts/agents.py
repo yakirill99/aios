@@ -124,9 +124,21 @@ _NUM_UNIT = re.compile(
 # вредно: критик написал «предел обводнённости [значение из расчёта]»
 # вместо 98,5%, и объяснение потеряло смысл.
 _KNOWN_VALUES = (
-    "98,5%", "98.5%", "8360 руб/т", "8 360 руб/т", "100 руб/м3",
-    "100 руб/м³", "500 м3/сут", "500 м³/сут", "50 бар", "300 бар",
+    "98,5%", "98.5%", "97,5%", "97.5%", "8360 руб/т", "8 360 руб/т",
+    "100 руб/м3", "100 руб/м³", "500 м3/сут", "500 м³/сут",
+    "50 бар", "300 бар", "8%", "8 %",
 )
+
+
+def add_known_values(*values: str) -> None:
+    """
+    Пополняет белый список величинами из конфигурации: пороги триггеров,
+    пределы. Без этого фильтр вырезал их из объяснений, и текст терял
+    смысл: «прорыв воды превысил [значение из расчёта]».
+    """
+    global _KNOWN_VALUES
+    _KNOWN_VALUES = tuple(dict.fromkeys(
+        _KNOWN_VALUES + tuple(v for v in values if v)))
 
 
 def scrub(text: str) -> str:
@@ -234,7 +246,8 @@ class AgentLayer:
 
     # --- РОЛЬ 2: СТРАТЕГ ----------------------------------------------
     def rank_candidates(self, cands: list[tuple], diag: dict, step: int,
-                        months_left: int, limit: int) -> list[tuple]:
+                        months_left: int, limit: int,
+                        links: dict | None = None) -> list[tuple]:
         """
         ГЛАВНАЯ точка, где агент влияет на результат.
 
@@ -264,12 +277,16 @@ class AgentLayer:
         # У модели спрашиваем короткий список, остальное добираем по
         # правилам. Просить 25 тегов из 34 бессмысленно: отбора почти нет,
         # а ответ раздувается и обрывается по потолку токенов.
-        ask_n = min(limit, 12)
+        # Место под noop резервируется: он вставляется принудительно, и
+        # без резерва последний выбор модели срезался обрезкой до limit,
+        # а счётчик показывал «9 из 8».
+        ask_n = max(2, min(limit - 1, 12))
 
         prompt = (
             f"{ECONOMIC_CONTEXT}\n"
             f"Шаг {step + 1}, до конца горизонта {months_left} месяцев.\n\n"
             f"Диагностика:\n{_fmt_diag(diag)}\n\n"
+            + _fmt_links(links, cands, months_left) +
             f"Варианты воздействий (тег = скважина_множитель, "
             f"PACK = несколько скважин сразу):\n" +
             "\n".join(f"- {t}: {_describe(acts)}" for t, acts in cands) +
@@ -330,6 +347,7 @@ class AgentLayer:
                 chosen_tags.add(t)
 
         picked = picked[:limit]
+        n_llm = min(n_llm, len(picked))
         self.last_source = f"агент ({n_llm} из {len(picked)})"
         self.llm_steps += 1
         self._trace("strategist", {
@@ -361,8 +379,9 @@ class AgentLayer:
         hyp_block = ""
         if hypotheses:
             hyp_block = ("Гипотезы, выдвинутые до расчёта:\n" +
-                         "\n".join(f"- {h.well} ({h.issue}): {h.rationale}"
-                                   for h in hypotheses) + "\n")
+                         "\n".join(f"- скв. {h.well} ({h.issue}): "
+                                   f"{h.rationale}" for h in hypotheses)
+                         + "\n")
 
         top = sorted(ranking.items(), key=lambda kv: -kv[1])[:5]
         prompt = (
@@ -394,6 +413,39 @@ _ISSUE_MAP = {"water_breakthrough": "watercut", "unprofitable": "unprofitable",
               "headroom": "headroom", "declining": "decline", "idle": "idle"}
 
 
+def _fmt_links(links: dict | None, cands: list[tuple],
+               months_left: int) -> str:
+    """
+    Связи между скважинами для промпта: кто на кого влияет и успеет ли
+    отклик до конца горизонта.
+
+    Данные измерены возмущающими прогонами, а не выдуманы моделью. Без
+    них агент отбирал кандидатов вслепую: код учитывал матрицу при
+    выборе целей, а стратег о связях не знал.
+    """
+    if not links:
+        return ""
+    wells = {a.well for _, acts in cands for a in acts}
+    lines = []
+    for w in sorted(wells):
+        for l in links.get(str(w), []):
+            fits = l["lag"] <= months_left
+            mark = "успеет" if fits else f"НЕ успеет, осталось {months_left}"
+            direction = "растёт" if l["sign"] == "+" else "падает"
+            lines.append(f"- скв. {w} влияет на скв. {l['observed']}: "
+                         f"отклик по нефти через {l['lag']} мес, "
+                         f"{direction}, {mark}")
+        if len(lines) >= 15:
+            break
+    if not lines:
+        return ""
+    return ("Связи между скважинами (измерены возмущающими прогонами):\n"
+            + "\n".join(lines[:15])
+            + "\nСвязь, отклик которой не успевает до конца горизонта, "
+              "пользы не принесёт: платим сейчас, эффект не доживёт до "
+              "оценки.\n\n")
+
+
 def _rule_order_pairs(cands: list[tuple]) -> list[tuple]:
     """
     Правиловый порядок: noop, пакеты, одиночные.
@@ -408,8 +460,31 @@ def _rule_order_pairs(cands: list[tuple]) -> list[tuple]:
     return noop + packs + rest
 
 
+# Подписи диагностики словами: голый ключ вида «unprofitable» модель
+# трактует произвольно, а список номеров без слова «скважины» читает как
+# количество. В прогоне это давало «17 скважин показывают падение
+# дебита» вместо «падает дебит у скважины 17».
+_DIAG_LABEL = {
+    "water_breakthrough": "прорыв воды",
+    "unprofitable": "убыточны",
+    "headroom": "есть запас по отбору",
+    "declining": "падает дебит",
+    "injection_useless": "закачка без отклика в окне",
+    "idle": "простаивают",
+}
+
+
 def _fmt_diag(diag: dict) -> str:
-    lines = [f"- {k}: {', '.join(v)}" for k, v in diag.items() if v]
+    lines = []
+    for k, v in diag.items():
+        if not v:
+            continue
+        label = _DIAG_LABEL.get(k, k)
+        wells = ", ".join(f"скв. {w}" for w in v)
+        # Число в скобках снимает двусмысленность: без него модель
+        # читала «unprofitable: 1» как КОЛИЧЕСТВО и писала в отчёт
+        # «17 скважин показывают падение дебита», где 17 — это номер.
+        lines.append(f"- {label} ({len(v)} шт.): {wells}")
     return "\n".join(lines) or "- отклонений не найдено"
 
 
@@ -420,9 +495,11 @@ def _describe(acts) -> str:
     parts = []
     for a in acts:
         kind = "отбор" if a.control == "LRAT" else "закачка"
+        # «скв.» перед номером обязательно: без него модель принимает
+        # номер скважины за количество скважин.
         m = re.search(r"x([\d.]+)", a.reason or "")
         direction = "увеличить" if (m and float(m.group(1)) > 1) else "снизить"
-        parts.append(f"{a.well}: {direction} {kind}")
+        parts.append(f"скв. {a.well}: {direction} {kind}")
     return "; ".join(parts)
 
 

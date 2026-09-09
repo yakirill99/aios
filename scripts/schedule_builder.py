@@ -95,6 +95,31 @@ class ScheduleBuilder:
         issues: list[ValidationIssue] = []
         seen: dict[tuple[str, str], int] = {}
 
+        # --- внешние ограничения ---------------------------------------
+        # Пределы уровня скважины проверяются ниже. Здесь — то, чего
+        # раньше не существовало: недоступность скважины в период и
+        # лимит числа воздействий за шаг.
+        try:
+            from constraints import Constraints
+            _lim = Constraints.load()
+        except Exception:                                  # noqa: BLE001
+            _lim = None
+
+        if _lim is not None:
+            if (_lim.max_actions_per_step is not None
+                    and len(self.actions) > _lim.max_actions_per_step):
+                issues.append(ValidationIssue(
+                    "error", "расписание",
+                    f"воздействий {len(self.actions)} при лимите "
+                    f"{_lim.max_actions_per_step}"))
+            for a in self.actions:
+                u = _lim.blocked_in(str(a.well), a.d, a.d)
+                if u is not None:
+                    issues.append(ValidationIssue(
+                        "error", f"действие {a.well} {a.date}",
+                        f"скважина недоступна: {u.reason}, "
+                        f"{u.start}..{u.end}"))
+
         for i, a in enumerate(self.actions):
             where = f"действие {i+1} ({a.well} {a.date})"
 
