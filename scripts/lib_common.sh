@@ -143,7 +143,7 @@ safe_parallel() {
     local want="${1:-6}" avail n cores
     avail=$(avail_ram_gb)
     n=$(awk "BEGIN{v=int(($avail - $MIN_FREE_RAM_GB)/$RAM_PER_RUN_GB); print v<1?1:v}")
-    cores=$(( $(nproc) / 2 ))          # два потока на процесс
+    cores=$(( $(nproc --all) / 2 ))          # два потока на процесс
     [ "$cores" -lt 1 ] && cores=1
     [ "$n" -gt "$cores" ] && n="$cores"
     [ "$n" -gt "$want" ] && n="$want"
@@ -153,7 +153,7 @@ safe_parallel() {
 mem_status() {
     local a t; a=$(avail_ram_gb)
     t=$(awk '/MemTotal/{printf "%.1f", $2/1048576}' /proc/meminfo)
-    echo "  память: в WSL доступно ${a} из ${t} ГБ; ядер $(nproc)"
+    echo "  память: в WSL доступно ${a} из ${t} ГБ; ядер $(nproc --all)"
     echo "          -> параллельность: $(safe_parallel 99) процессов"
 }
 
@@ -193,6 +193,7 @@ run_py() {
     local script="$1" out_dir="$2"; shift 2
     docker run --rm -i $USERFLAG -e HOME=/tmp \
         -v "$out_dir":/out -v "$SCRIPT_DIR":/scripts:ro \
+        -v "$AIOS_ROOT/configs":/configs:ro \
         "$IMAGE" python3 "/scripts/$script" "$@"
 }
 

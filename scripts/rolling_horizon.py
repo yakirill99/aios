@@ -32,8 +32,10 @@
       лучшего: при отклонении по порогу выигрыша цикл планировал по
       реальности, которой нет в расписании
   Д3  умолчания CLI приведены к Config и к конфигурации лучшего прогона
-  Д4  расчёт ЧДД идёт с SUBMISSION_ASSUMPTIONS — теми же допущениями,
-      которыми пройдена сверка с эталоном
+  Д4  допущения расчёта собраны в SUBMISSION_ASSUMPTIONS, одно место на
+      весь проект. На управляющем окне chargeInitialPump выключен: там
+      первая строка каждой скважины — начало окна, и флаг начислил бы
+      первичную установку всем 33 добывающим (минус 96,3 млн)
   Д5  пороги диагностики берутся из Config, а не дублируются литералами
   Д6  пропущенные шаги пишутся в журнал, resume больше не расходится
   Д7  расписание рендерится один раз; финальная дека собирается из того
@@ -43,6 +45,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +62,14 @@ from probe_wells import WellMode, parse_schedule                     # noqa
 from schedule_builder import (Action, ScheduleBuilder, build_deck,    # noqa
                               MAX_LIQUID_RATE)
 
+# Внешние ограничения. Без модуля цикл работает как раньше, на
+# зашитых пределах уровня скважины.
+try:
+    from constraints import Constraints
+    HAS_CONSTRAINTS = True
+except ImportError:
+    HAS_CONSTRAINTS = False
+
 # Агентный слой необязателен: без него цикл работает на правилах.
 try:
     from agents import AgentLayer
@@ -70,7 +82,15 @@ except ImportError:
 # Сверка с эталоном организаторов выбрала вариант с начислением первичной
 # установки ЭЦН: +0,92% против +3,53% без него. Заявляемое число обязано
 # считаться теми же допущениями, что и проверенное.
-SUBMISSION_ASSUMPTIONS = {"chargeInitialPump": True}
+SUBMISSION_ASSUMPTIONS: dict = {}
+# ВАЖНО: chargeInitialPump НЕ включается на управляющем периоде.
+# Эталон начисляет первичную установку при первом появлении скважины с
+# ненулевым дебитом. В файле истории это реальный ввод фонда 2007-2008,
+# и там флаг нужен: без него расхождение +2,75 % вместо +0,16 %.
+# В файле управляющего периода первая строка каждой скважины — февраль
+# 2014, и флаг начисляет первичную установку всем 33 добывающим,
+# занижая ЧДД на 96,3 млн: планка 922,7 вместо 1 018,986.
+# prepare_baseline.sh считает без флага — допущения обязаны совпадать.
 
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
           "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
@@ -122,6 +142,10 @@ class Config:
     image: str = "aios/opm:2026.04"
     mem_limit_gb: int = 4
     llm_mode: str = "off"               # off | live | replay
+    constraints_path: str = ""          # configs/constraints.yaml
+    events_path: str = ""               # файл недоступности скважин
+    external_path: str = ""             # файл ограничений организаторов
+    policy_path: str = ""               # well_policy.json из паспорта
 
 
 @dataclass
@@ -140,6 +164,11 @@ class StepRecord:
     analyst_summary: str = ""
     explanation: str = ""
     risk: str = ""
+    # ЧДД каждого посчитанного кандидата. Раньше журнал хранил только
+    # победителя, и разобраться, почему выигрыш вышел ровно нулевым,
+    # было нечем: деки шагов удаляются по ходу прогона.
+    npv_by_tag: dict = field(default_factory=dict)
+    rejected_by_limits: list = field(default_factory=list)
 
 
 # ==========================================================================
@@ -307,18 +336,41 @@ def pick_targets(states: dict[str, WellState], diag: dict, step: int,
     return prods + injs
 
 
-def make_candidates(targets: list[WellState], at: date, cfg: Config
+def make_candidates(targets: list[WellState], at: date, cfg: Config,
+                    policy: dict | None = None
                     ) -> list[tuple[str, list[Action]]]:
     """
     Кандидаты шага. Одиночные воздействия плюс лучшая пара из прошлого
     опыта: форсировать добывающую и перераспределить закачку.
+
+    Политика паспорта (`--policy`) действует здесь:
+      закрыть -> вместо уровней генерируется единственный кандидат SHUT;
+      запрет_форсирования -> уровни выше единицы не генерируются вовсе,
+      остаются снижение и noop, и скважина исключается из пакетов.
+
+    Запрет реализован ВЫЧЁРКИВАНИЕМ кандидата, а не указанием агенту.
+    Агент физически не может предложить то, чего нет во входном наборе,
+    поэтому правило гидродинамика проверяемо, а не обещано в промпте.
     """
     out: list[tuple[str, list[Action]]] = [("noop", [])]
     d = at.isoformat()
+    pol = policy or {}
+    blocked: list[str] = []
 
     for st in targets:
+        if st.kind == "prod" and policy_wants_shut(pol, st.name):
+            out.append((f"{st.name}_shut",
+                        [Action(date=d, well=st.name, control="SHUT",
+                                reason=policy_reason(pol, st.name))]))
+            blocked.append(st.name)
+            continue
+        no_boost = st.kind == "prod" and policy_forbids_boost(pol, st.name)
+        if no_boost:
+            blocked.append(st.name)
         for lv in cfg.levels:
             if abs(lv - 1.0) < 1e-9:
+                continue
+            if no_boost and lv > 1.0:
                 continue
             if st.kind == "prod":
                 base = st.q_liq
@@ -334,8 +386,13 @@ def make_candidates(targets: list[WellState], at: date, cfg: Config
                        reason=f"{base:.0f} -> {new:.0f} (x{lv})")
             out.append((f"{st.name}_x{lv:g}".replace(".", "p"), [a]))
 
-    prods = [s for s in targets if s.kind == "prod"]
+    prods = [s for s in targets
+             if s.kind == "prod"
+             and not policy_forbids_boost(pol, s.name)
+             and not policy_wants_shut(pol, s.name)]
     injs = [s for s in targets if s.kind == "inj"]
+    if blocked:
+        print(f"    [политика] форсирование запрещено: {', '.join(blocked)}")
 
     # На горизонте 23 месяца форсирование отбора — главный рычаг: эффект
     # приходит сразу, тогда как закачка работает с лагом 6-10 месяцев и
@@ -461,6 +518,50 @@ def add_months(d: date, n: int) -> date:
     return date(d.year + m // 12, m % 12 + 1, 1)
 
 
+def load_matrix_links(path: Path, top: int = 3) -> dict[str, list[dict]]:
+    """
+    Связи между скважинами для промпта стратега.
+
+    Матрица построена возмущающими прогонами и уже используется кодом при
+    отборе целей, но агент её не видел и выбирал вслепую. Здесь она
+    разворачивается в связи по каждому источнику: на кого влияет, через
+    сколько месяцев приходит отклик, в какую сторону.
+
+    Числа тут измеренные, а не выдуманные моделью: это входные данные
+    того же рода, что экономические нормативы.
+    """
+    if not path or not Path(path).exists():
+        return {}
+    import csv
+    raw: dict[str, list[dict]] = {}
+    for r in csv.DictReader(Path(path).open(encoding="utf-8-sig")):
+        if r.get("metric") != "oil":
+            continue
+        try:
+            src = str(r["source"])
+            link = {"observed": str(r["observed"]),
+                    "lag": int(r.get("lag_month", 0)),
+                    "sign": str(r.get("sign", "")).strip(),
+                    "strength": abs(float(r.get("peak_rel", 0) or 0))}
+        except (ValueError, KeyError):
+            continue
+        if link["observed"] == src:
+            continue                       # связь скважины с самой собой
+        raw.setdefault(src, []).append(link)
+
+    out: dict[str, list[dict]] = {}
+    for src, links in raw.items():
+        # одна пара встречается на разных уровнях возмущения:
+        # оставляем самую сильную по каждой наблюдаемой скважине
+        best: dict[str, dict] = {}
+        for l in links:
+            cur = best.get(l["observed"])
+            if cur is None or l["strength"] > cur["strength"]:
+                best[l["observed"]] = l
+        out[src] = sorted(best.values(), key=lambda l: -l["strength"])[:top]
+    return out
+
+
 def load_matrix_lags(path: Path) -> dict[str, list[int]]:
     """
     Лаги откликов по каждому источнику. Фильтрация НЕ статическая:
@@ -483,6 +584,66 @@ def load_matrix_lags(path: Path) -> dict[str, list[int]]:
     return out
 
 
+def _by_well_round_robin(items: list[tuple]) -> list[tuple]:
+    """
+    Одиночные кандидаты вперемешку по скважинам, а не лестницей.
+
+    Кандидаты генерируются по целям подряд: пять уровней первой скважины,
+    потом пять уровней второй. При малом лимите отбора все слоты уходили
+    на первую скважину — при лимите 8 оценивались noop, три пакета и
+    четыре уровня ОДНОЙ скважины, а остальные цели не проверялись ни разу.
+    Причём первой в списке обычно стоит самая проблемная скважина, которая
+    чаще всего упирается в предел отдачи и даёт нулевой отклик.
+
+    Здесь порядок разворачивается по кругу: по одному уровню на каждую
+    скважину, затем второй уровень, и так далее. При любом лимите
+    охватывается максимум разных скважин.
+    """
+    def level_of(tag: str) -> float:
+        m = re.search(r"_x(\d+)(?:p(\d+))?$", tag)
+        if not m:
+            return 1.0
+        return float(f"{m.group(1)}.{m.group(2) or '0'}")
+
+    def priority(item: tuple) -> float:
+        """
+        Порядок уровней внутри скважины.
+
+        Сетка задана как 0.7, 1.25, ... — то есть первым генерируется
+        СНИЖЕНИЕ. При переборе по кругу это означало, что первый круг
+        целиком уходил на снижение отбора, хотя главный рычаг —
+        форсирование, и все победители прогонов это подтверждают.
+
+        Для добывающих сначала идёт умеренное повышение, затем сильное,
+        затем снижение. Для нагнетательных наоборот: там выигрывает
+        снижение бесполезной закачки.
+        """
+        tag, acts = item
+        lv = level_of(tag)
+        inj = bool(acts) and getattr(acts[0], "control", "") == "RATE"
+        if inj:
+            return (lv, )                      # от меньшего к большему
+        # Для добывающих порядок ОБРАТНЫЙ: сильное форсирование первым.
+        # При малом лимите до второго круга дело не доходит, а все
+        # победители прогонов были высокими уровнями: x3 четырежды,
+        # x2.25 однажды. Начинать с x1.25 значит проверять самый слабый
+        # вариант и не увидеть настоящий выигрыш.
+        return (99.0 if lv < 1 else -lv, )      # снижение — в конец
+
+    by_well: dict[str, list[tuple]] = {}
+    for tag, acts in items:
+        key = acts[0].well if acts else tag
+        by_well.setdefault(str(key), []).append((tag, acts))
+    for w in by_well:
+        by_well[w].sort(key=priority)
+    out: list[tuple] = []
+    while any(by_well.values()):
+        for w in list(by_well):
+            if by_well[w]:
+                out.append(by_well[w].pop(0))
+    return out
+
+
 def _rule_order(cands: list[tuple]) -> list[tuple]:
     """
     Правиловый порядок кандидатов: noop, пакеты, одиночные.
@@ -494,13 +655,58 @@ def _rule_order(cands: list[tuple]) -> list[tuple]:
     noop = [c for c in cands if c[0] == "noop"]
     packs = [c for c in cands if c[0].startswith("PACK")]
     rest = [c for c in cands if c[0] != "noop" and not c[0].startswith("PACK")]
-    return noop + packs + rest
+    return noop + packs + _by_well_round_robin(rest)
 
 
 def useful_degree(lags: dict[str, list[int]], well: str,
                   months_left: int) -> int:
     """Сколько связей скважины успеют проявиться за оставшееся время."""
     return sum(1 for l in lags.get(well, []) if l <= months_left)
+
+
+# ==========================================================================
+# ПОЛИТИКА ПАСПОРТА
+# ==========================================================================
+def load_policy(path: str | Path | None) -> dict[str, dict]:
+    """
+    Жёсткие запреты гидродинамика. Файл делает well_passport.py по
+    configs/passport_rules.yaml: порогов и чисел здесь нет, только
+    результат применения правил к фонду.
+
+    Формат: {"1": {"запрет_форсирования": true, "закрыть": true,
+                   "правила": [...], "жёсткие": [...], "причина": "тег"}}
+
+    Файла нет — цикл работает как раньше. Это важно: политика ничего не
+    ломает по умолчанию, её включают явным аргументом.
+    """
+    if not path:
+        return {}
+    p = Path(path).expanduser()
+    if not p.exists():
+        print(f"  ВНИМАНИЕ: файл политики {p} не найден — иду без запретов")
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"  ВНИМАНИЕ: политика не прочитана ({e}) — иду без запретов")
+        return {}
+    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+
+
+def _num(x) -> int:
+    return int(x) if str(x).isdigit() else 0
+
+
+def policy_forbids_boost(policy: dict, well: str) -> bool:
+    return bool(policy.get(str(well), {}).get("запрет_форсирования"))
+
+
+def policy_wants_shut(policy: dict, well: str) -> bool:
+    return bool(policy.get(str(well), {}).get("закрыть"))
+
+
+def policy_reason(policy: dict, well: str) -> str:
+    return str(policy.get(str(well), {}).get("причина", "запрет паспорта"))
 
 
 class RollingHorizon:
@@ -510,11 +716,17 @@ class RollingHorizon:
         self.schedule: list[Action] = []
         self.journal: list[StepRecord] = []
         self.lags = load_matrix_lags(matrix) if matrix else {}
+        # Те же данные, развёрнутые в связи: кто на кого влияет и с каким
+        # лагом. Нужны стратегу — раньше он отбирал кандидатов, не зная,
+        # какие скважины связаны между собой.
+        self.links = load_matrix_links(matrix) if matrix else {}
         if self.lags:
             allv = [l for v in self.lags.values() for l in v]
             allv.sort()
+            n_links = sum(len(v) for v in self.links.values())
             print(f"  матрица: {len(self.lags)} источников, "
-                  f"медиана лага {allv[len(allv)//2]} мес")
+                  f"медиана лага {allv[len(allv)//2]} мес, "
+                  f"связей для агента {n_links}")
         self.states: dict[str, WellState] = {}
 
         sch = next(cfg.base.glob("INCLUDE/*sch*.inc"), None)
@@ -527,11 +739,73 @@ class RollingHorizon:
         self.jpath = self.wd / "journal.json"
         self.lock = self.wd / ".lock"
 
+        # Внешние ограничения: квоты по фонду, недоступность скважин.
+        self.limits = None
+        if HAS_CONSTRAINTS:
+            self.limits = Constraints.load(cfg.constraints_path or None)
+            if cfg.events_path:
+                k = self.limits.load_events(cfg.events_path)
+                print(f"  ограничений по времени: {k}")
+            if cfg.external_path:
+                from constraints import apply_external
+                apply_external(self.limits, cfg.external_path)
+            act = [x for x in (self.limits.max_total_liquid_rate,
+                               self.limits.max_total_injection_rate,
+                               self.limits.max_total_oil_period,
+                               self.limits.max_actions_per_step)
+                   if x is not None]
+            print(f"  ограничения: {self.limits.source}, "
+                  f"групповых задано {len(act)}, "
+                  f"недоступностей {len(self.limits.unavailable)}")
+
+        # Политика паспорта: запреты гидродинамика из passport_rules.yaml,
+        # применённые к фонду скриптом well_passport.py.
+        self.policy = load_policy(cfg.policy_path)
+        if self.policy:
+            n_prod_total = sum(1 for m in self.modes.values()
+                               if getattr(m, "kind", "") == "prod")
+            shut = [w for w in self.policy if policy_wants_shut(self.policy, w)]
+            ban = [w for w in self.policy
+                   if policy_forbids_boost(self.policy, w)]
+            print(f"  политика паспорта: {Path(cfg.policy_path).name}, "
+                  f"запрет форсирования у {len(ban)} скв., "
+                  f"на закрытие {len(shut) or 'нет'}")
+            if shut:
+                print(f"    закрыть: {', '.join(sorted(shut, key=_num))}")
+            if n_prod_total and len(ban) >= 0.5 * n_prod_total:
+                free = sorted((str(n) for n, m in self.modes.items()
+                               if getattr(m, "kind", "") == "prod"
+                               and not policy_forbids_boost(self.policy, n)),
+                              key=_num)
+                print(f"    ВНИМАНИЕ: запрет накрывает {len(ban)} из "
+                      f"{n_prod_total} добывающих. Форсирование остаётся "
+                      f"возможным только на: {', '.join(free) or 'НИ ОДНОЙ'}")
+                print("    Проверьте, что это осознанное решение: "
+                      "форсирование отбора — главный рычаг на 23 месяцах.")
+
         # Агентный слой. В режиме off все роли возвращают правиловый
         # результат, цикл считает ровно то же, что и без него.
         if HAS_AGENTS:
             self.agents = AgentLayer(LLMClient(mode=cfg.llm_mode),
                                      trace_path=self.wd / "llm_trace.jsonl")
+            # Пороги из конфигурации — не выдумка модели: разрешаем их
+            # в свободном тексте, иначе объяснения теряют смысл.
+            try:
+                from agents import add_known_values
+                add_known_values(
+                    f"{cfg.trig_watercut * 100:.1f}%".replace(".", ","),
+                    f"{cfg.trig_decline * 100:.0f}%",
+                    f"{self.limits.economic_watercut_limit * 100:.1f}%"
+                    .replace(".", ",") if self.limits else "",
+                    f"{self.limits.max_liquid_rate:.0f} м3/сут"
+                    if self.limits else "")
+            except ImportError:
+                pass
+            # Печатаем состояние КЛИЕНТА, а не значение конфигурации.
+            print(f"  агентный слой: {self.agents.llm.describe()}")
+            if self.agents.llm.mode != cfg.llm_mode:
+                print(f"  ВНИМАНИЕ: запрошен режим {cfg.llm_mode}, "
+                      f"клиент работает в {self.agents.llm.mode}")
         else:
             self.agents = None
             if cfg.llm_mode != "off":
@@ -666,7 +940,26 @@ class RollingHorizon:
                 sys.exit("опорный прогон не удался")
             self.states = read_state(self.runner, next(out.glob("*.SMSPEC")), self.cfg.cut)
             npv0 = self.runner.npv(out, self.cfg.cut)
-            print(f"  ЧДД без вмешательств: {npv0:,.1f} млн руб\n")
+            print(f"  ЧДД без вмешательств: {npv0:,.1f} млн руб")
+
+            # Сверка с планкой prepare_baseline.sh. Расхождение означает
+            # разные допущения расчёта — именно так один прогон вышел с
+            # планкой 922,7 вместо 1 019,0 и завышенным приростом.
+            bj = (Path(os.environ.get("DATA_ROOT", "~/aios-data")).expanduser()
+                  / "runs" / "baseline" / "baseline_npv.json")
+            if bj.exists():
+                try:
+                    ref = json.loads(bj.read_text(encoding="utf-8"))["npv_mln_rub"]
+                    d = npv0 - ref
+                    if abs(d) > 0.5:
+                        print(f"  ВНИМАНИЕ: у prepare_baseline {ref:,.1f} млн, "
+                              f"расхождение {d:+,.1f} — проверьте "
+                              f"SUBMISSION_ASSUMPTIONS")
+                    else:
+                        print(f"  совпадает с prepare_baseline ({ref:,.1f})")
+                except Exception:
+                    pass
+            print()
             self.baseline = npv0
         else:
             self.baseline = self.journal[0].npv_noop
@@ -720,6 +1013,17 @@ class RollingHorizon:
 
             targets = pick_targets(self.states, diag, step, self.cfg,
                                    self.lags, months_left)
+
+            # Скважина в ремонте не должна попадать в рассмотрение: без
+            # этого система продолжала бы предлагать по ней воздействия,
+            # не зная о недоступности.
+            if self.limits is not None and self.limits.unavailable:
+                before = list(targets)
+                targets = [t for t in targets
+                           if self.limits.is_available(str(t), cur)]
+                skipped = [t for t in before if t not in targets]
+                if skipped:
+                    print(f"  недоступны на {cur}: {', '.join(map(str, skipped))}")
             if not targets:
                 # Д6. Пропуск тоже пишется в журнал: иначе resume пройдёт
                 # шаг заново, но уже с другим состоянием, и цикл перестанет
@@ -730,8 +1034,24 @@ class RollingHorizon:
                 continue
             print(f"  рассматриваем: {', '.join(t.name for t in targets)}")
 
-            cands = make_candidates(targets, cur, self.cfg)
+            cands = make_candidates(targets, cur, self.cfg, self.policy)
             print(f"  кандидатов сгенерировано: {len(cands)}")
+
+            # Отбраковка по внешним ограничениям с записью причины.
+            dropped: list = []
+            if self.limits is not None:
+                kept = []
+                for tag, acts in cands:
+                    bad = self.limits.check_actions(acts, horizon_end)
+                    errs = [i for i in bad if i.severity == "error"]
+                    if errs and tag != "noop":
+                        dropped.append((tag, errs[0].message))
+                    else:
+                        kept.append((tag, acts))
+                if dropped:
+                    print(f"  отбраковано ограничениями: {len(dropped)}"
+                          f"  ({dropped[0][0]}: {dropped[0][1]})")
+                    cands = kept
 
             # Д1. Отбор до max_candidates происходит ЗДЕСЬ, после
             # ранжирования. В режиме off порядок правиловый:
@@ -739,11 +1059,14 @@ class RollingHorizon:
             if self.agents is not None:
                 cands = self.agents.rank_candidates(
                     cands, act_diag, step, months_left,
-                    limit=self.cfg.max_candidates)
-                who = "агент" if self.cfg.llm_mode != "off" else "правила"
+                    limit=self.cfg.max_candidates, links=self.links)
+                # Источник берётся из слоя по факту вызова, а не из
+                # конфигурации: раньше в логе стояло «(агент)» даже когда
+                # роль strategist не вызывалась ни разу.
+                who = self.agents.last_source
             else:
                 cands = _rule_order(cands)[:self.cfg.max_candidates]
-                who = "правила"
+                who = "правила (agents.py не установлен)"
             print(f"  отобрано на прогон: {len(cands)} ({who})")
 
             res = self.evaluate(cands, horizon_end, step)
@@ -823,7 +1146,9 @@ class RollingHorizon:
                 npv_window=best_npv, npv_noop=noop_npv, gain=gain,
                 n_candidates=len(cands), duration_s=time.time() - t0,
                 diagnosis=act_diag, analyst_summary=analyst,
-                explanation=explanation, risk=risk))
+                explanation=explanation, risk=risk,
+                npv_by_tag={k: round(v, 3) for k, v in res.items()},
+                rejected_by_limits=[t for t, _ in dropped] if self.limits else []))
             self.save()
 
             # чистим пробные прогоны шага, оставляем зачётный
@@ -875,6 +1200,10 @@ class RollingHorizon:
         print(f"воздействий: {len(self.schedule)}")
         print(f"расписание:  {inc}")
 
+        if self.agents is not None and self.cfg.llm_mode != "off":
+            print(f"\nагентный слой: {self.agents.status()}")
+            print(f"  {self.agents.llm.stats()}")
+
         print(f"\nПРОВЕРЬТЕ ПЕРЕД СДАЧЕЙ:")
         print(f"  ./validate.sh {out} --since {self.cfg.cut}")
 
@@ -884,20 +1213,40 @@ class RollingHorizon:
             "assumptions": SUBMISSION_ASSUMPTIONS,
             "cut": self.cfg.cut.isoformat(), "end": self.cfg.end.isoformat(),
             "levels": list(self.cfg.levels), "step_months": self.cfg.step_months,
+            "policy_path": self.cfg.policy_path,
+            "policy_shut": sorted((w for w in self.policy
+                                   if policy_wants_shut(self.policy, w)),
+                                  key=_num),
+            "policy_no_boost": sorted((w for w in self.policy
+                                       if policy_forbids_boost(self.policy, w)),
+                                      key=_num),
             "llm_mode": self.cfg.llm_mode,
+            "llm_mode_effective": (self.agents.llm.mode
+                                   if self.agents else "none"),
+            "llm_steps": (self.agents.llm_steps if self.agents else 0),
+            "rule_steps": (self.agents.rule_steps if self.agents else 0),
             "schedule": [asdict(a) for a in self.schedule],
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ==========================================================================
+# Пути берутся из окружения, как в lib_common.sh. Зашитый ~/aios ломал
+# работу во второй среде WSL, где репозиторий лежит по другому пути, и
+# цикл молча уходил искать деку не туда.
+AIOS_ROOT = Path(os.environ.get("AIOS_ROOT", "~/aios")).expanduser()
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", "~/aios-data")).expanduser()
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="скользящий горизонт")
     p.add_argument("cmd", choices=["plan", "run", "resume"])
-    p.add_argument("--base", default="~/aios/model/Model_Y_opm")
-    p.add_argument("--workdir", default="~/aios-data/rolling")
-    p.add_argument("--cut", default="2014-01-01",
+    p.add_argument("--base", default=str(AIOS_ROOT / "model/Model_Y_opm"),
+                   help="дека, адаптированная под OPM")
+    p.add_argument("--workdir", default=str(DATA_ROOT / "rolling"))
+    # Даты тоже не зашиты: в валидационном кейсе придут свои.
+    p.add_argument("--cut", default=os.environ.get("CUT_DATE", "2014-01-01"),
                    help="дата передачи управления (конец истории)")
-    p.add_argument("--end", default="2015-12-01",
+    p.add_argument("--end", default=os.environ.get("END_DATE", "2015-12-01"),
                    help="горизонт ЧДД ограничен декой")
     # Д3. Умолчания совпадают с Config и с конфигурацией, на которой
     # получен лучший результат. Запуск без аргументов обязан его
@@ -918,9 +1267,20 @@ def main() -> None:
                    help="вмешиваться на каждом шаге (дороже, обычно не нужно)")
     p.add_argument("--min-gain", type=float, default=2.0,
                    help="порог выигрыша, млн руб: ниже не переключаемся")
-    p.add_argument("--matrix", default="~/aios-data/probes/response_matrix.csv")
+    p.add_argument("--matrix",
+                   default=str(DATA_ROOT / "probes/response_matrix.csv"))
     p.add_argument("--llm", default="off", choices=["off", "live", "replay"],
                    help="режим агентного слоя")
+    p.add_argument("--constraints", default="",
+                   help="путь к configs/constraints.yaml")
+    p.add_argument("--events", default="",
+                   help="файл недоступности скважин (ремонты по датам)")
+    p.add_argument("--external", default="",
+                   help="файл ограничений организаторов (валидационный кейс)")
+    p.add_argument("--policy", default="",
+                   help="well_policy.json из well_passport.py: жёсткие "
+                        "запреты гидродинамика (закрытие, запрет "
+                        "форсирования). Без аргумента цикл идёт как раньше")
     a = p.parse_args()
 
     cfg = Config(
@@ -933,7 +1293,11 @@ def main() -> None:
         parallel=a.parallel,
         use_triggers=not a.no_triggers,
         trig_min_gain_mln=a.min_gain,
-        llm_mode=a.llm)
+        llm_mode=a.llm,
+        constraints_path=a.constraints,
+        events_path=a.events,
+        external_path=a.external,
+        policy_path=a.policy)
 
     rh = RollingHorizon(cfg, Path(a.matrix).expanduser() if a.matrix else None)
 

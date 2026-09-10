@@ -1,0 +1,185 @@
+{
+  "npv": 1148.5,
+  "baselineNpv": 1023.355,
+  "improvement": 125.2,
+  "iteration": 7,
+  "wellsActive": 33,
+  "wellsTotal": 49,
+  "progress": 65,
+  "candidates": 25,
+  "llmMode": "Live",
+  "autoUpdate": true,
+  "logAuto": true,
+  "logCount": 0,
+  "agents": {
+    "analyst": "Завершён",
+    "strategist": "Активен",
+    "critic": "Ожидание"
+  },
+  "wells": [
+    {
+      "id": "P1",
+      "type": "producer",
+      "status": "Активна",
+      "rate": 87,
+      "wc": 82
+    },
+    {
+      "id": "P2",
+      "type": "producer",
+      "status": "Активна",
+      "rate": 65,
+      "wc": 91
+    },
+    {
+      "id": "P3",
+      "type": "producer",
+      "status": "Активна",
+      "rate": 120,
+      "wc": 45
+    },
+    {
+      "id": "P4",
+      "type": "producer",
+      "status": "Закрыта",
+      "rate": 0,
+      "wc": 98
+    },
+    {
+      "id": "P5",
+      "type": "producer",
+      "status": "Активна",
+      "rate": 95,
+      "wc": 76
+    },
+    {
+      "id": "P6",
+      "type": "producer",
+      "status": "Активна",
+      "rate": 73,
+      "wc": 88
+    },
+    {
+      "id": "P7",
+      "type": "producer",
+      "status": "Активна",
+      "rate": 110,
+      "wc": 52
+    },
+    {
+      "id": "P8",
+      "type": "producer",
+      "status": "Активна",
+      "rate": 45,
+      "wc": 95
+    },
+    {
+      "id": "P9",
+      "type": "producer",
+      "status": "Закрыта",
+      "rate": 0,
+      "wc": 99
+    },
+    {
+      "id": "P10",
+      "type": "producer",
+      "status": "Активна",
+      "rate": 88,
+      "wc": 73
+    },
+    {
+      "id": "I1",
+      "type": "injector",
+      "status": "Активна",
+      "rate": 250,
+      "wc": null
+    },
+    {
+      "id": "I2",
+      "type": "injector",
+      "status": "Активна",
+      "rate": 180,
+      "wc": null
+    },
+    {
+      "id": "I3",
+      "type": "injector",
+      "status": "Активна",
+      "rate": 210,
+      "wc": null
+    },
+    {
+      "id": "I4",
+      "type": "injector",
+      "status": "Активна",
+      "rate": 195,
+      "wc": null
+    },
+    {
+      "id": "I5",
+      "type": "injector",
+      "status": "Закрыта",
+      "rate": 0,
+      "wc": null
+    },
+    {
+      "id": "I6",
+      "type": "injector",
+      "status": "Активна",
+      "rate": 165,
+      "wc": null
+    }
+  ],
+  "logs": [
+    {
+      "time": "14:32:15",
+      "msg": "🚀 Запуск цикла оптимизации",
+      "type": "info"
+    },
+    {
+      "time": "14:32:18",
+      "msg": "📥 Загрузка состояния пласта",
+      "type": "info"
+    },
+    {
+      "time": "14:35:42",
+      "msg": "🧠 Агент-аналитик: оценка текущего состояния",
+      "type": "info"
+    },
+    {
+      "time": "14:36:10",
+      "msg": "📊 Генерация 25 кандидатов управления",
+      "type": "info"
+    },
+    {
+      "time": "14:45:33",
+      "msg": "✅ Стратег: выбрано оптимальное решение",
+      "type": "success"
+    },
+    {
+      "time": "14:45:35",
+      "msg": "🔍 Критик: проверка ограничений пройдена",
+      "type": "info"
+    },
+    {
+      "time": "14:46:02",
+      "msg": "💰 NPV: 1,148.5 млн руб. (+125.2 млн)",
+      "type": "success"
+    },
+    {
+      "time": "14:50:12",
+      "msg": "🔄 Начало следующей итерации",
+      "type": "info"
+    },
+    {
+      "time": "14:52:30",
+      "msg": "⚠️ Обновление прогнозной модели",
+      "type": "warning"
+    },
+    {
+      "time": "14:55:18",
+      "msg": "✅ wells_schedule.inc сгенерирован",
+      "type": "success"
+    }
+  ]
+}

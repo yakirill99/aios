@@ -35,3 +35,12 @@ vendor/model/*/USER/
 *.csv
 .lock
 *.tar.gz
+*.bak
+*.py.bak
+*.sh.bak
+
+# демо-данные дашборда: без них контейнер поднимается с пустым экраном
+!ui/demo/*.json
+
+# кэш ответов модели: без него не работает --llm replay
+!cache/llm/*.json

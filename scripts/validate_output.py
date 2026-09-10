@@ -33,7 +33,10 @@ import math
 import sys
 from dataclasses import dataclass, asdict, field
 
-# --- пределы. Источники: методика ЧДД и дека Model_Y --------------------
+# --- пределы --------------------------------------------------------------
+# Значения по умолчанию совпадают с configs/constraints.yaml. Если модуль
+# constraints доступен, пределы читаются оттуда: правка конфигурации
+# должна влиять на поведение, иначе файл декоративен.
 MAX_LIQUID_RATE = 500.0     # м3/сут — выше методика ЧДД не считает
 MIN_BHP_PROD = 50.0         # бар — техминимум добывающих (из WCONPROD)
 MAX_BHP_INJ = 300.0         # бар — предел нагнетательных (из WCONINJE)
@@ -65,6 +68,9 @@ class Report:
     period: str = ""
     scope: str = "весь горизонт"
     compensation: float | None = None
+    peak_liquid_rate: float | None = None
+    peak_injection_rate: float | None = None
+    oil_period_kt: float | None = None
     errors: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     checks_run: list = field(default_factory=list)
@@ -74,10 +80,31 @@ class Report:
         return not self.errors
 
 
+def load_limits(path: str | None = None):
+    """Пределы из configs/constraints.yaml, если модуль доступен."""
+    try:
+        from constraints import Constraints
+    except ImportError:
+        return None
+    try:
+        return Constraints.load(path)
+    except Exception as e:                       # noqa: BLE001
+        print(f"  ! не удалось прочитать ограничения: {e}")
+        return None
+
+
 def validate(smspec: str, max_report: int = 8, since=None,
              comp_min: float = COMP_MIN, comp_max: float = COMP_MAX,
-             comp_hard: bool = False) -> Report:
+             comp_hard: bool = False, limits=None) -> Report:
     from resdata.summary import Summary
+
+    # Пределы уровня скважины — из конфигурации, если она прочиталась.
+    max_liq = limits.max_liquid_rate if limits else MAX_LIQUID_RATE
+    min_bhp = limits.min_bhp_producer if limits else MIN_BHP_PROD
+    max_bhp = limits.max_bhp_injector if limits else MAX_BHP_INJ
+    if limits:
+        comp_min = limits.compensation_min
+        comp_max = limits.compensation_max
 
     s = Summary(smspec)
     keys = set(s.keys())
@@ -146,9 +173,9 @@ def validate(smspec: str, max_report: int = 8, since=None,
         # --- потолок по жидкости --------------------------------------
         if wlpr:
             for i, x in enumerate(wlpr):
-                if x > MAX_LIQUID_RATE + TOL:
-                    err("max_liquid", w, i, x, MAX_LIQUID_RATE,
-                        f"дебит жидкости {x:.1f} > {MAX_LIQUID_RATE:.0f} — "
+                if x > max_liq + TOL:
+                    err("max_liquid", w, i, x, max_liq,
+                        f"дебит жидкости {x:.1f} > {max_liq:.0f} — "
                         f"методика ЧДД такое не считает")
                 if x < -TOL:
                     err("negative_rate", w, i, x, 0.0,
@@ -167,13 +194,13 @@ def validate(smspec: str, max_report: int = 8, since=None,
                           else (wlpr[i] > 0.01 if wlpr else False))
                 if not active:
                     continue          # закрытая скважина: BHP не показатель
-                if is_inj and x > MAX_BHP_INJ + TOL:
-                    err("max_bhp_inj", w, i, x, MAX_BHP_INJ,
-                        f"забойное нагнетательной {x:.1f} > {MAX_BHP_INJ:.0f} бар "
+                if is_inj and x > max_bhp + TOL:
+                    err("max_bhp_inj", w, i, x, max_bhp,
+                        f"забойное нагнетательной {x:.1f} > {max_bhp:.0f} бар "
                         f"— риск разрыва пласта")
-                if not is_inj and 0 < x < MIN_BHP_PROD - TOL:
-                    err("min_bhp_prod", w, i, x, MIN_BHP_PROD,
-                        f"забойное добывающей {x:.1f} < {MIN_BHP_PROD:.0f} бар "
+                if not is_inj and 0 < x < min_bhp - TOL:
+                    err("min_bhp_prod", w, i, x, min_bhp,
+                        f"забойное добывающей {x:.1f} < {min_bhp:.0f} бар "
                         f"— ниже техминимума")
                 if x > MAX_PRESSURE or (0 < x < MIN_PRESSURE):
                     warn("pressure_range", w, i, x, MAX_PRESSURE,
@@ -228,6 +255,56 @@ def validate(smspec: str, max_report: int = 8, since=None,
             (err if comp_hard else warn)(
                 "compensation", "FIELD", 0, comp, comp_max, msg)
 
+    # --- ГРУППОВЫЕ ОГРАНИЧЕНИЯ ПО ФОНДУ ---------------------------------
+    # Раньше механизма не существовало: проверялись только пределы по
+    # каждой скважине, а квота на суммарную добычу — это не другое
+    # значение существующего предела, а отсутствовавшая проверка.
+    if limits is not None:
+        rep.checks_run.append("групповые ограничения по фонду")
+        per_step = []
+        for i, d in enumerate(dates):
+            liq = inj = 0.0
+            for w in wells:
+                v = vec("WLPR", w)
+                if v:
+                    liq += max(0.0, v[i])
+                v = vec("WWIR", w)
+                if v:
+                    inj += max(0.0, v[i])
+            per_step.append({"date": d, "liquid_rate": liq,
+                             "injection_rate": inj})
+        rep.peak_liquid_rate = round(max(p["liquid_rate"] for p in per_step), 1)
+        rep.peak_injection_rate = round(max(p["injection_rate"] for p in per_step), 1)
+
+        oil_kt = 0.0
+        for w in wells:
+            v = vec("WOPT", w)
+            if v:
+                oil_kt += (v[-1] - v[0]) * 0.832 / 1000.0
+        rep.oil_period_kt = round(oil_kt, 1)
+
+        for it in (limits.check_field_rates(per_step)
+                   + limits.check_field_totals(oil_kt)):
+            err("field_limit", "FIELD", 0, 0.0, 0.0, it.message)
+
+        # --- НЕДОСТУПНОСТЬ СКВАЖИН -------------------------------------
+        if limits.unavailable:
+            rep.checks_run.append("скважина не работает в период недоступности")
+            for u in limits.unavailable:
+                if u.well not in wells:
+                    continue
+                wlpr, wwir = vec("WLPR", u.well), vec("WWIR", u.well)
+                for i, d in enumerate(dates):
+                    if not u.covers(d):
+                        continue
+                    active = ((wlpr[i] if wlpr else 0) > 0.01
+                              or (wwir[i] if wwir else 0) > 0.01)
+                    if active:
+                        err("unavailable", u.well, i, 0.0, 0.0,
+                            f"работает в период недоступности "
+                            f"({u.reason}, {u.start}..{u.end})")
+                        break
+
     # --- поле в целом --------------------------------------------------
     if "FPR" in keys:
         fpr = list(s.numpy_vector("FPR"))[i0:]
@@ -247,6 +324,11 @@ def print_report(rep: Report, max_show: int = 8) -> None:
     print(f"проверок: {len(rep.checks_run)}")
     if rep.compensation is not None:
         print(f"компенсация закачки: {rep.compensation:.3f}")
+    if rep.peak_liquid_rate is not None:
+        print(f"пик по фонду: жидкость {rep.peak_liquid_rate:,.0f} м3/сут, "
+              f"закачка {rep.peak_injection_rate:,.0f} м3/сут")
+    if rep.oil_period_kt is not None:
+        print(f"добыча нефти за период: {rep.oil_period_kt:,.1f} тыс. т")
 
     if rep.errors:
         print(f"\n  ОШИБОК: {len(rep.errors)}")
@@ -280,18 +362,40 @@ def main() -> None:
                                    "печатается отдельная сводка по окну")
     p.add_argument("--comp-min", type=float, default=COMP_MIN)
     p.add_argument("--comp-max", type=float, default=COMP_MAX)
+    p.add_argument("--constraints",
+                   help="путь к configs/constraints.yaml")
+    p.add_argument("--events",
+                   help="файл недоступности скважин: скважина, начало, конец")
+    p.add_argument("--external",
+                   help="файл ограничений организаторов (валидационный кейс)")
     p.add_argument("--comp-hard", action="store_true",
                    help="считать нарушение компенсации ошибкой, а не "
                         "предупреждением")
     a = p.parse_args()
 
+    limits = load_limits(a.constraints)
+    if limits and a.events:
+        n = limits.load_events(a.events)
+        print(f"  загружено ограничений по времени: {n}")
+    if limits and a.external:
+        from constraints import apply_external
+        apply_external(limits, a.external)
+    if limits:
+        active = [x for x in (limits.max_total_liquid_rate,
+                              limits.max_total_injection_rate,
+                              limits.max_total_oil_period,
+                              limits.max_actions_per_step) if x is not None]
+        print(f"  ограничения: {limits.source}, "
+              f"групповых задано {len(active)}, "
+              f"недоступностей {len(limits.unavailable)}")
+
     reports = [validate(a.smspec, comp_min=a.comp_min, comp_max=a.comp_max,
-                        comp_hard=a.comp_hard)]
+                        comp_hard=a.comp_hard, limits=limits)]
     if a.since:
         from datetime import date as _date
         reports.append(validate(a.smspec, since=_date.fromisoformat(a.since),
                                 comp_min=a.comp_min, comp_max=a.comp_max,
-                                comp_hard=a.comp_hard))
+                                comp_hard=a.comp_hard, limits=limits))
 
     for i, rep in enumerate(reports):
         if i:

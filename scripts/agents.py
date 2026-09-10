@@ -38,6 +38,16 @@ from llm_client import LLMClient
 # Числа здесь — ВХОДНЫЕ константы методики, а не результат расчёта:
 # они задают рамку рассуждения и в выходное расписание не попадают.
 # ==========================================================================
+ANALYST_ROLE = """\
+Ты инженер-разработчик месторождения. Тебе показывают диагностику фонда
+на одном шаге управления. Твоя задача — описать, что происходит, и
+назвать скважины, которые заслуживают внимания.
+
+Не рассуждай об экономике и не пересказывай условия задачи: нужны только
+наблюдения по этим данным. Величин не называй.
+"""
+
+
 ECONOMIC_CONTEXT = """\
 Контекст задачи (нефтяное месторождение, 49 скважин, синтетическая модель).
 
@@ -78,14 +88,19 @@ class AnalysisReport(BaseModel):
     hypotheses: list[Hypothesis] = Field(description="до пяти гипотез")
 
 
-class Pick(BaseModel):
-    tag: str = Field(description="тег кандидата ТОЧНО из предложенного списка")
-    rationale: str = Field(description="одно предложение, без чисел")
-
-
 class StrategyPlan(BaseModel):
-    """Стратег: какие кандидаты отдать в прогон и в каком порядке."""
-    picks: list[Pick] = Field(description="отобранные кандидаты, лучший первым")
+    """
+    Стратег: какие кандидаты отдать в прогон и в каком порядке.
+
+    Раньше на каждый тег требовалось обоснование, и ответ на 25 позиций
+    не влезал в потолок num_predict: JSON обрывался на середине строки,
+    разбор падал, слой уходил в правила. Теперь список — плоские строки,
+    а обоснование одно на весь отбор.
+    """
+    picks: list[str] = Field(
+        description="теги кандидатов ТОЧНО из списка, лучший первым")
+    reasoning: str = Field(
+        description="одно-два предложения на весь отбор, без чисел")
 
 
 class Verdict(BaseModel):
@@ -115,10 +130,43 @@ _NUM_UNIT = re.compile(
     re.IGNORECASE)
 
 
+# Константы методики — ВХОДНЫЕ данные, а не выдумка модели. Резать их
+# вредно: критик написал «предел обводнённости [значение из расчёта]»
+# вместо 98,5%, и объяснение потеряло смысл.
+_KNOWN_VALUES = (
+    "98,5%", "98.5%", "97,5%", "97.5%", "8360 руб/т", "8 360 руб/т",
+    "100 руб/м3", "100 руб/м³", "500 м3/сут", "500 м³/сут",
+    "50 бар", "300 бар", "8%", "8 %",
+)
+
+
+def add_known_values(*values: str) -> None:
+    """
+    Пополняет белый список величинами из конфигурации: пороги триггеров,
+    пределы. Без этого фильтр вырезал их из объяснений, и текст терял
+    смысл: «прорыв воды превысил [значение из расчёта]».
+    """
+    global _KNOWN_VALUES
+    _KNOWN_VALUES = tuple(dict.fromkeys(
+        _KNOWN_VALUES + tuple(v for v in values if v)))
+
+
 def scrub(text: str) -> str:
-    """Убирает выдуманные величины из свободного текста."""
-    cleaned = _NUM_UNIT.sub("[значение из расчёта]", text or "")
-    return re.sub(r"\s{2,}", " ", cleaned).strip()
+    """
+    Убирает выдуманные величины из свободного текста, оставляя
+    константы методики нетронутыми.
+    """
+    text = text or ""
+    holes = {}
+    for i, v in enumerate(_KNOWN_VALUES):          # прячем известные
+        if v in text:
+            key = f"\x00{i}\x00"
+            text = text.replace(v, key)
+            holes[key] = v
+    text = _NUM_UNIT.sub("[значение из расчёта]", text)
+    for key, v in holes.items():                   # возвращаем на место
+        text = text.replace(key, v)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 def has_invented_numbers(text: str) -> bool:
@@ -133,12 +181,29 @@ class AgentLayer:
     """
 
     def __init__(self, client: LLMClient | None = None,
-                 trace_path=None):
+                 trace_path=None, warmup: bool = True):
         self.llm = client or LLMClient()
         self.trace_path = trace_path
+        # Первый содержательный вызов иначе платит за загрузку весов и
+        # упирается в тайм-аут, а слой молча уходит на правила.
+        if warmup and self.llm.mode == "live":
+            ok, msg = self.llm.warmup()
+            print(f"  [llm] {msg}")
         self.rejected = 0          # сколько ответов отбраковано валидацией
+        # Кто на самом деле отобрал кандидатов на последнем шаге.
+        # Цикл печатает именно это, а не значение конфигурации: раньше в
+        # логе стояло «(агент)» даже когда роль strategist не вызывалась.
+        self.last_source = "правила"
+        self.llm_steps = 0         # шагов, где отбор сделала модель
+        self.rule_steps = 0        # шагов, где сработали правила
 
     # ------------------------------------------------------------------
+    def status(self) -> str:
+        """Строка для итога прогона: кто реально принимал решения."""
+        return (f"отбор кандидатов: моделью на {self.llm_steps} шагах, "
+                f"правилами на {self.rule_steps}; "
+                f"отброшено несуществующих тегов: {self.rejected}")
+
     def _trace(self, role: str, payload: dict) -> None:
         if not self.trace_path:
             return
@@ -161,19 +226,34 @@ class AgentLayer:
                                    confidence="высокая")
                         for k, ws in diag.items() for w in ws[:2]][:3])
 
+        # ВАЖНО: экономический блок аналитику НЕ передаётся.
+        # Четыре прогона подряд модель пересказывала его дословно вместо
+        # анализа: «Контекст задачи: нефтяное месторождение с 49
+        # скважинами...». Прямой запрет в промпте не помог. Аналитик
+        # описывает состояние, а не выбирает действие — экономика ему не
+        # нужна. Она остаётся у стратега и критика, где влияет на выбор.
         prompt = (
-            f"{ECONOMIC_CONTEXT}\n"
+            f"{ANALYST_ROLE}\n"
             f"Шаг управления {step + 1}. До конца горизонта {months_left} месяцев.\n\n"
             f"Правиловая диагностика фонда:\n{_fmt_diag(diag)}\n\n"
             f"Сработавшие триггеры:\n" +
             ("\n".join(f"- {t}" for t in triggers) or "- нет") +
-            "\n\nСформулируй, что происходит на объекте, и до пяти гипотез. "
-            "Не называй никаких величин."
+            "\n\nОпиши, что происходит именно на ЭТОМ шаге: одно-два "
+            "предложения про состояние фонда и до трёх гипотез по "
+            "конкретным скважинам из диагностики выше.\n"
+            "НЕ пересказывай условия задачи и экономический контекст — "
+            "он уже известен, повтор бесполезен. Только наблюдения по "
+            "этим данным.\n"
+            "Если данных не хватает — ставь низкую уверенность, а не "
+            "придумывай объяснение. Величин не называй."
         )
         res = self.llm.complete(prompt, AnalysisReport, fallback=fallback,
                                 system="Ты инженер-разработчик месторождения.")
         res = res or fallback
         res.summary = scrub(res.summary)
+        # Описание «до трёх» модель не обязана соблюдать: JSON Schema
+        # длину массива не ограничивает. Режем в коде.
+        res.hypotheses = res.hypotheses[:3]
         for h in res.hypotheses:
             h.rationale = scrub(h.rationale)
         self._trace("analyst", {"step": step, "summary": res.summary,
@@ -182,7 +262,8 @@ class AgentLayer:
 
     # --- РОЛЬ 2: СТРАТЕГ ----------------------------------------------
     def rank_candidates(self, cands: list[tuple], diag: dict, step: int,
-                        months_left: int, limit: int) -> list[tuple]:
+                        months_left: int, limit: int,
+                        links: dict | None = None) -> list[tuple]:
         """
         ГЛАВНАЯ точка, где агент влияет на результат.
 
@@ -194,38 +275,62 @@ class AgentLayer:
         подсунуть в расписание величину, которой не было в наборе.
         """
         by_tag = dict(cands)
-        packs = [t for t, _ in cands if t.startswith("PACK")]
-        # правиловый порядок: noop, пакеты, остальное — пакеты давали
-        # заметно больше одиночных воздействий
-        rule_order = (["noop"] if "noop" in by_tag else []) + packs + \
-                     [t for t, _ in cands if t != "noop" and t not in packs]
-        fallback = [(t, by_tag[t]) for t in rule_order[:limit]]
+        # Правиловый порядок: noop, пакеты, затем одиночные ВПЕРЕМЕШКУ
+        # по скважинам. Раньше здесь строился отдельный список, минуя
+        # _rule_order_pairs, и режим off продолжал брать лестницу уровней
+        # одной скважины: при лимите 8 оценивались четыре уровня первой
+        # цели, а остальные пять скважин не проверялись ни разу.
+        rule_order_pairs = _rule_order_pairs(cands)
+        fallback = rule_order_pairs[:limit]
 
         if self.llm.mode == "off" or len(cands) <= limit:
+            self.last_source = ("правила"
+                                if self.llm.mode == "off"
+                                else "правила (кандидатов не больше лимита)")
+            self.rule_steps += 1
             return fallback
+
+        # У модели спрашиваем короткий список, остальное добираем по
+        # правилам. Просить 25 тегов из 34 бессмысленно: отбора почти нет,
+        # а ответ раздувается и обрывается по потолку токенов.
+        # Место под noop резервируется: он вставляется принудительно, и
+        # без резерва последний выбор модели срезался обрезкой до limit,
+        # а счётчик показывал «9 из 8».
+        ask_n = max(2, min(limit - 1, 12))
 
         prompt = (
             f"{ECONOMIC_CONTEXT}\n"
             f"Шаг {step + 1}, до конца горизонта {months_left} месяцев.\n\n"
             f"Диагностика:\n{_fmt_diag(diag)}\n\n"
+            + _fmt_links(links, cands, months_left) +
             f"Варианты воздействий (тег = скважина_множитель, "
             f"PACK = несколько скважин сразу):\n" +
             "\n".join(f"- {t}: {_describe(acts)}" for t, acts in cands) +
-            f"\n\nПрогон каждого варианта дорог, посчитать можно только {limit}. "
-            f"Отбери {limit} самых перспективных, лучший первым. "
-            f"Теги копируй буквально. Величины не называй."
+            f"\n\nПрогон каждого варианта дорог. Назови {ask_n} самых "
+            f"перспективных тегов, лучший первым, и одно общее обоснование.\n"
+            f"Правила отбора:\n"
+            f"- не бери больше двух уровней одной и той же скважины: разные "
+            f"множители на одной скважине дают близкий результат, и бюджет "
+            f"прогонов тратится впустую;\n"
+            f"- включи хотя бы один вариант PACK, если он есть в списке: "
+            f"одновременные воздействия обычно дают больше, чем те же "
+            f"действия по одному;\n"
+            f"- теги копируй буквально из списка, величин не называй."
         )
         plan = self.llm.complete(prompt, StrategyPlan, fallback=None,
                                  system="Ты инженер по оптимизации разработки.")
 
         if plan is None:
-            self._trace("strategist", {"step": step, "used": "fallback"})
+            self.last_source = "правила (модель не ответила)"
+            self.rule_steps += 1
+            self._trace("strategist", {"step": step, "used": "fallback",
+                                       "reason": self.llm.last_error})
             return fallback
 
         # ВАЛИДАЦИЯ: тег обязан быть из входного набора
         picked, unknown = [], []
-        for p in plan.picks:
-            tag = p.tag.strip()
+        for raw in plan.picks:
+            tag = str(raw).strip()
             if tag in by_tag and tag not in [t for t, _ in picked]:
                 picked.append((tag, by_tag[tag]))
             else:
@@ -240,16 +345,33 @@ class AgentLayer:
             picked.insert(0, ("noop", by_tag["noop"]))
 
         if len(picked) < 2:
+            self.last_source = "правила (мало валидных тегов)"
+            self.rule_steps += 1
             self._trace("strategist", {"step": step, "used": "fallback",
                                        "reason": "мало валидных тегов"})
             return fallback
 
+        # Добираем до limit правиловым хвостом: бюджет прогонов всё равно
+        # оплачен, и терять его из-за короткого ответа модели незачем.
+        n_llm = len(picked)
+        chosen_tags = {t for t, _ in picked}
+        for t, acts in rule_order_pairs:
+            if len(picked) >= limit:
+                break
+            if t not in chosen_tags:
+                picked.append((t, acts))
+                chosen_tags.add(t)
+
         picked = picked[:limit]
+        n_llm = min(n_llm, len(picked))
+        self.last_source = f"агент ({n_llm} из {len(picked)})"
+        self.llm_steps += 1
         self._trace("strategist", {
             "step": step, "used": "llm",
-            "picked": [t for t, _ in picked],
-            "rationale": {p.tag: scrub(p.rationale) for p in plan.picks
-                          if p.tag in by_tag}})
+            "picked_by_llm": [t for t, _ in picked[:n_llm]],
+            "filled_by_rules": len(picked) - n_llm,
+            "rejected_tags": unknown,
+            "reasoning": scrub(plan.reasoning)})
         return picked
 
     # --- РОЛЬ 3: КРИТИК -----------------------------------------------
@@ -273,8 +395,9 @@ class AgentLayer:
         hyp_block = ""
         if hypotheses:
             hyp_block = ("Гипотезы, выдвинутые до расчёта:\n" +
-                         "\n".join(f"- {h.well} ({h.issue}): {h.rationale}"
-                                   for h in hypotheses) + "\n")
+                         "\n".join(f"- скв. {h.well} ({h.issue}): "
+                                   f"{h.rationale}" for h in hypotheses)
+                         + "\n")
 
         top = sorted(ranking.items(), key=lambda kv: -kv[1])[:5]
         prompt = (
@@ -306,8 +429,138 @@ _ISSUE_MAP = {"water_breakthrough": "watercut", "unprofitable": "unprofitable",
               "headroom": "headroom", "declining": "decline", "idle": "idle"}
 
 
+def _fmt_links(links: dict | None, cands: list[tuple],
+               months_left: int) -> str:
+    """
+    Связи между скважинами для промпта: кто на кого влияет и успеет ли
+    отклик до конца горизонта.
+
+    Данные измерены возмущающими прогонами, а не выдуманы моделью. Без
+    них агент отбирал кандидатов вслепую: код учитывал матрицу при
+    выборе целей, а стратег о связях не знал.
+    """
+    if not links:
+        return ""
+    wells = {a.well for _, acts in cands for a in acts}
+    lines = []
+    for w in sorted(wells):
+        for l in links.get(str(w), []):
+            fits = l["lag"] <= months_left
+            mark = "успеет" if fits else f"НЕ успеет, осталось {months_left}"
+            direction = "растёт" if l["sign"] == "+" else "падает"
+            lines.append(f"- скв. {w} влияет на скв. {l['observed']}: "
+                         f"отклик по нефти через {l['lag']} мес, "
+                         f"{direction}, {mark}")
+        if len(lines) >= 15:
+            break
+    if not lines:
+        return ""
+    return ("Связи между скважинами (измерены возмущающими прогонами):\n"
+            + "\n".join(lines[:15])
+            + "\nСвязь, отклик которой не успевает до конца горизонта, "
+              "пользы не принесёт: платим сейчас, эффект не доживёт до "
+              "оценки.\n\n")
+
+
+def _by_well_round_robin(items: list[tuple]) -> list[tuple]:
+    """
+    Одиночные кандидаты вперемешку по скважинам, а не лестницей.
+
+    Кандидаты генерируются по целям подряд: пять уровней первой скважины,
+    потом пять уровней второй. При малом лимите отбора все слоты уходили
+    на первую скважину — при лимите 8 оценивались noop, три пакета и
+    четыре уровня ОДНОЙ скважины, а остальные цели не проверялись ни разу.
+    Причём первой в списке обычно стоит самая проблемная скважина, которая
+    чаще всего упирается в предел отдачи и даёт нулевой отклик.
+
+    Здесь порядок разворачивается по кругу: по одному уровню на каждую
+    скважину, затем второй уровень, и так далее. При любом лимите
+    охватывается максимум разных скважин.
+    """
+    def level_of(tag: str) -> float:
+        m = re.search(r"_x(\d+)(?:p(\d+))?$", tag)
+        if not m:
+            return 1.0
+        return float(f"{m.group(1)}.{m.group(2) or '0'}")
+
+    def priority(item: tuple) -> float:
+        """
+        Порядок уровней внутри скважины.
+
+        Сетка задана как 0.7, 1.25, ... — то есть первым генерируется
+        СНИЖЕНИЕ. При переборе по кругу это означало, что первый круг
+        целиком уходил на снижение отбора, хотя главный рычаг —
+        форсирование, и все победители прогонов это подтверждают.
+
+        Для добывающих сначала идёт умеренное повышение, затем сильное,
+        затем снижение. Для нагнетательных наоборот: там выигрывает
+        снижение бесполезной закачки.
+        """
+        tag, acts = item
+        lv = level_of(tag)
+        inj = bool(acts) and getattr(acts[0], "control", "") == "RATE"
+        if inj:
+            return (lv, )                      # от меньшего к большему
+        # Для добывающих порядок ОБРАТНЫЙ: сильное форсирование первым.
+        # При малом лимите до второго круга дело не доходит, а все
+        # победители прогонов были высокими уровнями: x3 четырежды,
+        # x2.25 однажды. Начинать с x1.25 значит проверять самый слабый
+        # вариант и не увидеть настоящий выигрыш.
+        return (99.0 if lv < 1 else -lv, )      # снижение — в конец
+
+    by_well: dict[str, list[tuple]] = {}
+    for tag, acts in items:
+        key = acts[0].well if acts else tag
+        by_well.setdefault(str(key), []).append((tag, acts))
+    for w in by_well:
+        by_well[w].sort(key=priority)
+    out: list[tuple] = []
+    while any(by_well.values()):
+        for w in list(by_well):
+            if by_well[w]:
+                out.append(by_well[w].pop(0))
+    return out
+
+
+def _rule_order_pairs(cands: list[tuple]) -> list[tuple]:
+    """
+    Правиловый порядок: noop, пакеты, одиночные.
+
+    Пакеты вперёд намеренно: одновременные воздействия дают больше
+    растянутых по шагам, потому что дисконт удешевляет позднее действие.
+    При обрезке до K первыми должны выживать они.
+    """
+    noop = [c for c in cands if c[0] == "noop"]
+    packs = [c for c in cands if c[0].startswith("PACK")]
+    rest = [c for c in cands if c[0] != "noop" and not c[0].startswith("PACK")]
+    return noop + packs + _by_well_round_robin(rest)
+
+
+# Подписи диагностики словами: голый ключ вида «unprofitable» модель
+# трактует произвольно, а список номеров без слова «скважины» читает как
+# количество. В прогоне это давало «17 скважин показывают падение
+# дебита» вместо «падает дебит у скважины 17».
+_DIAG_LABEL = {
+    "water_breakthrough": "прорыв воды",
+    "unprofitable": "убыточны",
+    "headroom": "есть запас по отбору",
+    "declining": "падает дебит",
+    "injection_useless": "закачка без отклика в окне",
+    "idle": "простаивают",
+}
+
+
 def _fmt_diag(diag: dict) -> str:
-    lines = [f"- {k}: {', '.join(v)}" for k, v in diag.items() if v]
+    lines = []
+    for k, v in diag.items():
+        if not v:
+            continue
+        label = _DIAG_LABEL.get(k, k)
+        wells = ", ".join(f"скв. {w}" for w in v)
+        # Число в скобках снимает двусмысленность: без него модель
+        # читала «unprofitable: 1» как КОЛИЧЕСТВО и писала в отчёт
+        # «17 скважин показывают падение дебита», где 17 — это номер.
+        lines.append(f"- {label} ({len(v)} шт.): {wells}")
     return "\n".join(lines) or "- отклонений не найдено"
 
 
@@ -318,9 +571,11 @@ def _describe(acts) -> str:
     parts = []
     for a in acts:
         kind = "отбор" if a.control == "LRAT" else "закачка"
+        # «скв.» перед номером обязательно: без него модель принимает
+        # номер скважины за количество скважин.
         m = re.search(r"x([\d.]+)", a.reason or "")
         direction = "увеличить" if (m and float(m.group(1)) > 1) else "снизить"
-        parts.append(f"{a.well}: {direction} {kind}")
+        parts.append(f"скв. {a.well}: {direction} {kind}")
     return "; ".join(parts)
 
 
@@ -358,6 +613,7 @@ def _self_test() -> int:
         print(f"   аналитик: {rep_.summary[:76]}")
         picked = ag.rank_candidates(cands, diag, 0, 23, limit=3)
         print(f"   стратег:  {[t for t, _ in picked]}")
+        assert len(picked) == 3, "добор правилами не сработал"
         assert all(t in dict(cands) for t, _ in picked), "выдуманный тег прошёл"
         assert "noop" in [t for t, _ in picked], "noop потерян"
         v = ag.explain("PACK_prod_x1p5", 42.7,

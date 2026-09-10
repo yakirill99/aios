@@ -23,6 +23,18 @@
 
 4. Скрипт ЧДД ОТКАЗЫВАЕТСЯ считать, если WLPR > 500 м3/сут.
    Проверяем здесь, чтобы не узнать об этом на последнем шаге.
+
+5. МЕТКА ДАТЫ = ДАТА ТОЧКИ СВОДКИ, а не месяц добычи.
+   Разность накопленных в точке 01.02.2014 — это добыча за январь, но
+   организаторы помечают её ФЕВРАЛЁМ. Проверено сверкой годовой добычи
+   с их таблицей: при их разметке расхождение ЧДД 0,08 %, при сдвиге на
+   месяц назад — 0,92 %, а добыча 2007 года расходится на 27 %.
+   Итог по годам при верной разметке:
+       2007  57,4 против 57,296      2015  104,5 против 104,342
+   Разметка влияет не на объёмы, а на разнесение по годам, то есть на
+   дисконтирование: месяц, уехавший из 2015 в 2007, стоит по-разному.
+   Флаг --legacy-labels воспроизводит прежнее поведение для сравнения
+   со старыми прогонами.
 --------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -32,7 +44,15 @@ import csv
 import sys
 from datetime import date, datetime
 
-OIL_DENSITY = 0.833      # т/м3, среднее по DENSITY из pvt.inc (832/834 кг/м3)
+# Плотности из секции DENSITY деки (DemoSpe_002_2_pvt.inc):
+#     832  1012.8  1.139 /      первый PVT-регион
+#     834  1012.8  1.139 /      второй PVT-регион
+#
+# Организаторы берут 832, а не среднее по двум регионам. Доказательство:
+# их годовая добыча относится к нашей как 1,0012 ВО ВСЕХ девяти годах,
+# а 833/832 = 1,00120. Совпадение до третьего знака на девяти точках.
+OIL_DENSITY = 0.832      # т/м3, первый PVT-регион
+WATER_DENSITY = 1.0128   # т/м3, вода, одна на оба региона
 MAX_WLPR = 500.0         # жёсткий предел методики
 
 COLUMNS = ["DATA", "well", "WLPT", "WLPR", "WOMT", "WOMR", "WWIR", "WWIT",
@@ -40,11 +60,48 @@ COLUMNS = ["DATA", "well", "WLPT", "WLPR", "WOMT", "WOMR", "WWIR", "WWIT",
 
 
 def _prev_month(d: date) -> date:
-    """Первое число предыдущего месяца."""
+    """Первое число предыдущего месяца. Только для --legacy-labels."""
     return date(d.year - 1, 12, 1) if d.month == 1 else date(d.year, d.month - 1, 1)
 
 
-def read_summary(path: str, oil_density: float, start: str | None = None):
+def _next_month(d: date) -> date:
+    """Первое число следующего месяца."""
+    return date(d.year + 1, 1, 1) if d.month == 12 else date(d.year, d.month + 1, 1)
+
+
+def read_densities_from_deck(deck_dir: str) -> tuple[float, float] | None:
+    """
+    Первая запись секции DENSITY из деки -> (нефть, вода) в т/м3.
+
+    Зачем: константа под конкретную деку ломается на валидационном
+    кейсе. Плотность входит в массу нефти линейно, и ошибка в 0,12 %
+    даёт 7,6 млн в ЧДД — это замерено.
+    """
+    import glob
+    import re
+    for pat in (f"{deck_dir}/INCLUDE/*.inc", f"{deck_dir}/*.inc",
+                f"{deck_dir}/*.DATA"):
+        for fn in sorted(glob.glob(pat)):
+            try:
+                txt = open(fn, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            m = re.search(r"^[ \t]*DENSITY[ \t]*$", txt, re.M | re.I)
+            if not m:
+                continue
+            for line in txt[m.end():].splitlines():
+                line = line.split("--")[0].strip()
+                if not line or line.startswith("/"):
+                    continue
+                nums = re.findall(r"[-+]?\d*\.?\d+", line)
+                if len(nums) >= 2:
+                    return float(nums[0]) / 1000.0, float(nums[1]) / 1000.0
+    return None
+
+
+def read_summary(path: str, oil_density: float, start: str | None = None,
+                 legacy_labels: bool = False,
+                 water_density: float = WATER_DENSITY):
     from resdata.summary import Summary
 
     s = Summary(path)
@@ -60,6 +117,9 @@ def read_summary(path: str, oil_density: float, start: str | None = None):
                    if any(f"{m}:{w}" in keys for m in WELL_MARKERS))
     if not wells:
         sys.exit("в сводке нет скважинных векторов")
+    if not any(f"WWPT:{w}" in keys for w in wells):
+        print("  ! в сводке нет WWPT — масса жидкости будет равна массе "
+              "нефти. Добавьте WWPT в секцию SUMMARY деки")
     dropped = sorted(candidates - set(wells))
     if dropped:
         print(f"  пропущено не-скважинных имён: {len(dropped)} "
@@ -84,12 +144,16 @@ def read_summary(path: str, oil_density: float, start: str | None = None):
         wopt, wopr = vec("WOPT", w), vec("WOPR", w)
         wwit, wwir = vec("WWIT", w), vec("WWIR", w)
         bhp, thp = vec("WBHP", w), vec("WTHP", w)
+        # Вода отдельно: колонка WLPT в расчёте ЧДД — это МАССА жидкости,
+        # а WLPT симулятора — объём. Нефть легче кубометра, вода тяжелее.
+        wwpt, wwpr = vec("WWPT", w), vec("WWPR", w)
 
         for i, d in enumerate(dates):
             if start_d and d < start_d:
                 # до отсечки в выборку не пишем, но запоминаем накопленные:
                 # от них будет считаться первая разность после отсечки
-                base_cum[w] = {"WLPT": wlpt[i],
+                base_cum[w] = {"WLPT": (wopt[i] * oil_density
+                                        + wwpt[i] * water_density),
                                "WOMT": wopt[i] * oil_density,
                                "WWIT": wwit[i]}
                 continue
@@ -97,18 +161,25 @@ def read_summary(path: str, oil_density: float, start: str | None = None):
             womt = wopt[i] * oil_density        # объём -> масса
             womr = wopr[i] * oil_density
 
+            # Масса жидкости = масса нефти + масса воды. Раньше в колонку
+            # шёл объём WLPT, и жидкость завышалась тем сильнее, чем ниже
+            # обводнённость: 2007 год расходился с эталоном на 6,5 %.
+            wlmt = womt + wwpt[i] * water_density
+
             if wlpr[i] > MAX_WLPR:
                 warnings.append(f"{w} {d}: WLPR={wlpr[i]:.1f} > {MAX_WLPR}")
 
+            # Метка — дата точки сводки, как у организаторов. Разность
+            # в точке 01.02 физически относится к январю, но в их таблице
+            # она стоит февралём, и от этого зависит год дисконтирования.
+            label = _prev_month(d) if legacy_labels else date(d.year, d.month, 1)
+
             rows.append({
-                # ВАЖНО: разность в точке T — это добыча за ПРЕДЫДУЩИЙ
-                # месяц (накопленное на 01.02 минус на 01.01 = январь).
-                # Помечаем месяцем добычи, иначе период съезжает на месяц
-                # и декабрь 2015 «появляется», хотя разности для него нет.
-                "DATA": _prev_month(d).isoformat(),
+                "DATA": label.isoformat(),
                 "well": w,
-                "WLPT": round(wlpt[i], 4),
-                "WLPR": round(wlpr[i], 4),
+                "WLPT": round(wlmt, 4),         # масса, не объём
+                "WLPR": round(wlpr[i], 4),      # дебит остаётся объёмным:
+                                                # предел 500 м3/сут именно по нему
                 "WOMT": round(womt, 4),
                 "WOMR": round(womr, 4),
                 "WWIR": round(wwir[i], 4),
@@ -116,11 +187,11 @@ def read_summary(path: str, oil_density: float, start: str | None = None):
                 "THP": round(thp[i], 4),
                 "BHP": round(bhp[i], 4),
                 "WEFF": 1,
-                "WLPT_Diff": round(wlpt[i] - prev[w]["WLPT"], 4),
+                "WLPT_Diff": round(wlmt - prev[w]["WLPT"], 4),
                 "WOMT_Diff": round(womt - prev[w]["WOMT"], 4),
                 "WWIT_Diff": round(wwit[i] - prev[w]["WWIT"], 4),
             })
-            prev[w] = {"WLPT": wlpt[i], "WOMT": womt, "WWIT": wwit[i]}
+            prev[w] = {"WLPT": wlmt, "WOMT": womt, "WWIT": wwit[i]}
 
     # первая дата сводки — это момент старта расчёта (нулевые накопленные),
     # разности в ней не имеют смысла и только мусорят выборку
@@ -136,10 +207,16 @@ def read_summary(path: str, oil_density: float, start: str | None = None):
     #
     # Берём ПОСЛЕДНЮЮ точку месяца: накопленные величины на конец месяца —
     # это то, что нужно для разностей.
+    # Точка первого числа — граница месяца, именно её ждёт эталон.
+    # Внутримесячные точки (01.02 и 15.02 при дроблении шага) попадают в
+    # ту же группу, и «последняя выигрывает» смещало бы границу месяца.
     by_key: dict[tuple, dict] = {}
     for r in rows:
-        y, m, _ = r["DATA"].split("-")
-        by_key[(r["well"], y, m)] = r          # последняя перезаписывает
+        y, m, dd = r["DATA"].split("-")
+        key = (r["well"], y, m)
+        prev = by_key.get(key)
+        if prev is None or dd == "01" or prev["DATA"].split("-")[2] != "01":
+            by_key[key] = r
     dropped = len(rows) - len(by_key)
     rows = list(by_key.values())
 
@@ -164,12 +241,17 @@ def read_summary(path: str, oil_density: float, start: str | None = None):
     # остановки и пуска. Раньше их отсев терял 21 событие за 2007 год.
     # Первая точка периода даёт разность за месяц ДО начала управления —
     # это история, в наш расчёт она не входит.
+    # Первая строка периода — это разность за месяц ДО передачи
+    # управления, то есть история. При разметке по точке сводки она
+    # помечена самой датой отсечки, поэтому граница строгая.
     if start_d:
-        before = [r for r in rows if r["DATA"] < start_d.isoformat()]
+        edge = (start_d.isoformat() if legacy_labels
+                else _next_month(start_d).isoformat())
+        before = [r for r in rows if r["DATA"] < edge]
         if before:
-            rows = [r for r in rows if r["DATA"] >= start_d.isoformat()]
-            print(f"  отброшено {len(before)} строк за месяц до начала "
-                  f"управления")
+            rows = [r for r in rows if r["DATA"] >= edge]
+            print(f"  отброшено {len(before)} строк истории "
+                  f"(до {edge})")
 
     if dropped:
         print(f"  свёрнуто внутримесячных точек: {dropped}")
@@ -190,9 +272,31 @@ def main() -> None:
     p.add_argument("--start", help="начальная дата, напр. 2014-01-01")
     p.add_argument("--oil-density", type=float, default=OIL_DENSITY,
                    help=f"т/м3, по умолчанию {OIL_DENSITY}")
+    p.add_argument("--water-density", type=float, default=WATER_DENSITY,
+                   help=f"т/м3, по умолчанию {WATER_DENSITY}")
+    p.add_argument("--deck", help="каталог деки: плотности читаются из "
+                                  "секции DENSITY, а не берутся из констант")
+    p.add_argument("--legacy-labels", action="store_true",
+                   help="прежняя разметка со сдвигом на месяц назад: "
+                        "только для сравнения со старыми прогонами")
     a = p.parse_args()
 
-    rows, wells, warnings = read_summary(a.smspec, a.oil_density, a.start)
+    if a.deck:
+        dens = read_densities_from_deck(a.deck)
+        if dens:
+            a.oil_density, a.water_density = dens
+            print(f"  плотности из деки: нефть {a.oil_density}, "
+                  f"вода {a.water_density} т/м3")
+        else:
+            print(f"  ! секция DENSITY в {a.deck} не найдена, "
+                  f"беру значения по умолчанию")
+
+    rows, wells, warnings = read_summary(a.smspec, a.oil_density, a.start,
+                                         legacy_labels=a.legacy_labels,
+                                         water_density=a.water_density)
+    if a.legacy_labels:
+        print("  ! РАЗМЕТКА LEGACY: сдвиг на месяц назад, расхождение "
+              "с эталоном вырастет до ~0,9 %")
     if not rows:
         sys.exit("нет строк — проверьте --start и содержимое сводки")
 
@@ -204,7 +308,7 @@ def main() -> None:
     print(f"записано: {a.output}")
     print(f"  строк: {len(rows)}, скважин: {len(wells)}")
     print(f"  период: {rows[0]['DATA']} -> {rows[-1]['DATA']}")
-    print(f"  плотность нефти: {a.oil_density} т/м3")
+    print(f"  плотность: нефть {a.oil_density}, вода {a.water_density} т/м3")
 
     neg = sum(1 for r in rows if r["WLPT_Diff"] < 0
               or r["WOMT_Diff"] < 0 or r["WWIT_Diff"] < 0)
