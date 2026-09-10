@@ -225,6 +225,77 @@ def _g(rules: dict, section: str, key: str, default=None):
     return (rules.get(section) or {}).get(key, default)
 
 
+def _flag(rules: dict, section: str, key: str, default=False) -> bool:
+    v = _g(rules, section, key, default)
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "yes", "да", "1")
+    return bool(v)
+
+
+def bans(m: dict, rules: dict) -> list[dict]:
+    """
+    Запреты гидродинамика. ОДИН источник истины на три потребителя:
+    тег в карточке агента, рекомендация в таблице для жюри и (через
+    --policy) фильтр кандидатов в rolling_horizon.
+
+    Раздел YAML сработал -> словарь с тегом, действием и флагом
+    жёсткости. Список отсортирован по ключу «приоритет»: правило с
+    меньшим номером перебивает остальные.
+
+    Раздела нет в YAML -> правило не проверяется. Так гидродинамик
+    выключает правило, не трогая код.
+    """
+    if m["kind"] != "prod":
+        return []
+    out: list[dict] = []
+
+    thr = _g(rules, "убыточные", "порог_нефти_м3_сут")
+    if thr is not None and m["q_oil"] <= float(thr):
+        out.append({
+            "раздел": "убыточные",
+            "тег": _g(rules, "убыточные", "тег_кандидат_на_закрытие"),
+            "действие": _g(rules, "убыточные", "действие", "закрыть"),
+            "приоритет": float(_g(rules, "убыточные", "приоритет", 1)),
+            "жёсткий": _flag(rules, "убыточные", "жёсткий_запрет", True)})
+
+    crit = _g(rules, "запрет_форсирования", "обводнённость_критическая")
+    if crit is not None and m["wct"] >= float(crit):
+        out.append({
+            "раздел": "запрет_форсирования",
+            "тег": _g(rules, "запрет_форсирования", "тег_запрет_форсирования"),
+            "действие": _g(rules, "запрет_форсирования",
+                           "действие_вместо_форсирования"),
+            "приоритет": float(_g(rules, "запрет_форсирования", "приоритет", 2)),
+            "жёсткий": _flag(rules, "запрет_форсирования", "жёсткий_запрет")})
+
+    cap = _g(rules, "запрет_форсирования_потолок", "дебит_жидкости_потолок")
+    if cap is not None and m["q_liq"] >= float(cap) - EPS:
+        out.append({
+            "раздел": "запрет_форсирования_потолок",
+            "тег": _g(rules, "запрет_форсирования_потолок",
+                      "тег_упёрлась_в_потолок"),
+            "действие": _g(rules, "запрет_форсирования_потолок",
+                           "действие_вместо_форсирования"),
+            "приоритет": float(_g(rules, "запрет_форсирования_потолок",
+                                  "приоритет", 3)),
+            "жёсткий": _flag(rules, "запрет_форсирования_потолок",
+                             "жёсткий_запрет")})
+
+    tmin = _g(rules, "забойное", "техминимум_бар")
+    if tmin is not None and m.get("bhp") is not None:
+        tol = float(_g(rules, "забойное", "допуск_бар", 1.0))
+        if m["bhp"] <= float(tmin) + tol:
+            out.append({
+                "раздел": "забойное",
+                "тег": _g(rules, "забойное", "тег_на_техминимуме"),
+                "действие": _g(rules, "продуктивность", "тег_не_отвечает"),
+                "приоритет": float(_g(rules, "забойное", "приоритет", 4)),
+                "жёсткий": _flag(rules, "забойное", "жёсткий_запрет")})
+
+    out.sort(key=lambda x: x["приоритет"])
+    return out
+
+
 def build_card(w: str, m: dict, rules: dict, links: dict) -> dict:
     tags: list[str] = []
     r = rules
@@ -233,7 +304,10 @@ def build_card(w: str, m: dict, rules: dict, links: dict) -> dict:
         wct = m["wct"]
         lim = float(_g(r, "обводнённость", "экономический_предел", 0.985))
         hi = float(_g(r, "обводнённость", "высокая", 0.92))
-        if wct >= hi:
+        if wct >= lim:
+            tags.append(_g(r, "обводнённость", "тег_за_пределом")
+                        or _g(r, "обводнённость", "тег_высокая"))
+        elif wct >= hi:
             tags.append(_g(r, "обводнённость", "тег_высокая"))
         else:
             tags.append(_g(r, "обводнённость", "тег_норма"))
@@ -250,8 +324,19 @@ def build_card(w: str, m: dict, rules: dict, links: dict) -> dict:
         else:
             tags.append(_g(r, "падение_дебита", "тег_стабильна"))
 
+        # Запреты гидродинамика идут ПЕРЕД тегом запаса: тег «есть куда
+        # форсировать» не должен стоять рядом с «форсирование запрещено».
+        # Раньше он выпадал всем 33 добывающим и не нёс информации.
+        forbidden = bans(m, rules)
+        for b in forbidden:
+            if b["тег"]:
+                tags.append(b["тег"])
+
         headroom = (500.0 - m["q_liq"]) / 500.0
-        if headroom >= float(_g(r, "продуктивность", "запас_до_предела_доля", 0.5)):
+        if forbidden:
+            tags.append(_g(r, "продуктивность", "тег_упирается"))
+        elif headroom >= float(_g(r, "продуктивность",
+                                  "запас_до_предела_доля", 0.5)):
             tags.append(_g(r, "продуктивность", "тег_есть_запас"))
         else:
             tags.append(_g(r, "продуктивность", "тег_упирается"))
@@ -307,10 +392,15 @@ def build_card(w: str, m: dict, rules: dict, links: dict) -> dict:
 
 
 def months_to_limit(m: dict, limit: float) -> float | None:
-    if m["kind"] != "prod" or m["wct_slope"] <= EPS:
+    if m["kind"] != "prod":
         return None
+    # Порядок важен: скважина, уже перешедшая предел, имеет нулевой
+    # наклон (расти некуда) и раньше получала None — прочерк вместо
+    # «за пределом». Это и дало противоречие в карточке скважины 1.
     if m["wct"] >= limit:
         return 0.0
+    if m["wct_slope"] <= EPS:
+        return None
     return (limit - m["wct"]) / m["wct_slope"]
 
 
@@ -323,7 +413,19 @@ def recommend(m: dict, card: dict, margin, rules: dict,
                 else "снизить: связей в окне нет")
     lim = float(_g(rules, "обводнённость", "экономический_предел", 0.985))
     left = months_to_limit(m, lim)
+
+    # Запреты гидродинамика перебивают всё остальное. Порядок задан
+    # ключом «приоритет» в YAML, не кодом.
+    forbidden = bans(m, rules)
+    if forbidden:
+        top = forbidden[0]
+        if top["раздел"] == "убыточные":
+            return f"{top['действие']}: {_g(rules, 'убыточные', 'тег_кандидат_на_закрытие')}"
+        return f"не форсировать: {top['действие']}"
+
     if margin is not None and margin <= 0:
+        if m["wct"] >= lim:
+            return "закрыть: за экономическим пределом обводнённости"
         return "убыточна: закрывать невыгодно, пока обводнённость ниже предела"
     if left is not None and left < months_left:
         return "не форсировать: в окне упрётся в экономический предел"
@@ -351,10 +453,23 @@ def render_md(metrics: dict, cards: dict, rows: list[dict]) -> str:
         f"История до {metrics['cut']}. Скважин: {len(rows)}. "
         f"Пластовое давление: `{src}`. Индекс продуктивности: `{pi_src}`.",
         note,
-        "| Скв | Тип | Qн, м³/сут | Qж, м³/сут | Обводн. | До предела "
-        "| PI, м³/сут·бар | Маржа, тыс.₽/сут | Рекомендация |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| Скв | Тип | Qн, м³/сут | Qж (доб.) / закачка, м³/сут | Обводн. "
+        "| Забойное, бар | До предела | PI, м³/сут·бар "
+        "| Маржа, тыс.₽/сут | Рекомендация |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
+    def left_cell(v) -> str:
+        # Прочерк раньше означал сразу три разных вещи. Теперь: «—» это
+        # обводнённость не растёт, «за пределом» — уже перешла, «> 10 лет»
+        # — экстраполяция даёт сотни месяцев и числом её печатать нечестно.
+        if v is None:
+            return "—"
+        if v <= EPS:
+            return "за пределом"
+        if v > 120:
+            return "> 10 лет"
+        return f"{v:.0f} мес"
+
     for r in rows:
         m, prod = r["m"], r["m"]["kind"] == "prod"
         out.append(
@@ -363,15 +478,22 @@ def render_md(metrics: dict, cards: dict, rows: list[dict]) -> str:
             f"| {cell(m['q_oil'] if prod else None)} "
             f"| {cell(m['q_liq'] if prod else m['q_inj'])} "
             f"| {cell(m['wct'] * 100 if prod else None, '{:.1f}%')} "
-            f"| {cell(r['left'], '{:.0f} мес')} "
-            f"| {cell(m.get('pi'), '{:.3f}')} "
+            f"| {cell(m.get('bhp'), '{:.0f}')} "
+            f"| {left_cell(r['left'])} "
+            f"| {cell(m.get('pi') if prod else None, '{:.3f}')} "
             f"| {cell(r['margin'], '{:+.0f}')} "
             f"| {r['rec']} |")
 
     out += ["", "## Как читать", "",
             "Колонка «до предела» — сколько месяцев осталось до "
             "экономического предела обводнённости при текущем темпе "
-            "роста. Прочерк означает, что обводнённость не растёт.", "",
+            "роста. Прочерк означает, что обводнённость не растёт; "
+            "«за пределом» — что предел уже пройден; «> 10 лет» — что "
+            "экстраполяция даёт сотни месяцев и точное число смысла "
+            "не имеет.", "",
+            "Забойное давление 50 бар — технический минимум. Скважина на "
+            "техминимуме отбирает всё, что отдаёт пласт: форсирование "
+            "режима ей команду изменит, а дебит нет.", "",
             "Колонка «рекомендация» написана правилами из "
             "`configs/passport_rules.yaml` и вычитана построчно."]
     return "\n".join(out) + "\n"
@@ -385,6 +507,7 @@ def cmd_cards(a) -> int:
 
     cards: dict[str, dict] = {}
     rows: list[dict] = []
+    policy: dict[str, dict] = {}
     lim = float(_g(rules, "обводнённость", "экономический_предел", 0.985))
 
     for w, m in metrics["wells"].items():
@@ -393,6 +516,16 @@ def cmd_cards(a) -> int:
         rows.append({"well": w, "m": m, "margin": margin,
                      "left": months_to_limit(m, lim),
                      "rec": recommend(m, card, margin, rules, a.months_left)})
+        b = bans(m, rules)
+        if b:
+            hard = [x for x in b if x["жёсткий"]]
+            policy[w] = {
+                "запрет_форсирования": bool(hard),
+                "закрыть": any(x["раздел"] == "убыточные" for x in hard),
+                "правила": [x["раздел"] for x in b],
+                "жёсткие": [x["раздел"] for x in hard],
+                "причина": b[0]["тег"],
+            }
 
     rows.sort(key=lambda r: _num_key(r["well"]))
 
@@ -405,11 +538,45 @@ def cmd_cards(a) -> int:
     md.write_text(render_md(metrics, cards, rows), encoding="utf-8")
 
     empty = [w for w, c in cards.items() if not c["tags"]]
-    print(f"скважин: {len(cards)}  (добывающих "
-          f"{sum(1 for c in cards.values() if c['kind'] == 'prod')})")
+    n_prod = sum(1 for c in cards.values() if c["kind"] == "prod")
+    print(f"скважин: {len(cards)}  (добывающих {n_prod})")
     print(f"карточки: {out_json}")
     print(f"таблица:  {md}")
     print(f"без тегов: {empty or 'нет'}")
+
+    # --- ЧТО СДЕЛАЛИ ПРАВИЛА ЗАПРЕТА -------------------------------------
+    # Сводка печатается всегда: правило, которое молча срабатывает на
+    # трёх четвертях фонда, должно быть видно до прогона, а не после.
+    if policy:
+        by_rule: dict[str, list[str]] = {}
+        for w, p in policy.items():
+            for sec in p["правила"]:
+                by_rule.setdefault(sec, []).append(w)
+        print("\nзапреты гидродинамика:")
+        for sec, ws in by_rule.items():
+            hard = _flag(rules, sec, "жёсткий_запрет",
+                         sec == "убыточные")
+            print(f"  {sec}: {len(ws)} скв. "
+                  f"({'ЖЁСТКИЙ' if hard else 'только тег'}) "
+                  f"{', '.join(sorted(ws, key=_num_key))}")
+        hard_all = sorted((w for w, p in policy.items()
+                           if p["запрет_форсирования"]), key=_num_key)
+        free = sorted((w for w, c in cards.items()
+                       if c["kind"] == "prod" and w not in set(hard_all)),
+                      key=_num_key)
+        print(f"  форсирование запрещено жёстко: {len(hard_all)} из {n_prod}")
+        print(f"  остаются к форсированию: {', '.join(free) or 'НИ ОДНОЙ'}")
+        shut = sorted((w for w, p in policy.items() if p["закрыть"]),
+                      key=_num_key)
+        if shut:
+            print(f"  на закрытие: {', '.join(shut)}")
+
+    if a.policy:
+        pj = Path(a.policy).expanduser()
+        pj.parent.mkdir(parents=True, exist_ok=True)
+        pj.write_text(json.dumps(policy, ensure_ascii=False, indent=2),
+                      encoding="utf-8")
+        print(f"политика для цикла: {pj}")
 
     # FR-7.2: в карточках не должно быть чисел
     import re
@@ -440,6 +607,9 @@ def main() -> int:
     c.add_argument("--months-left", type=int, default=23)
     c.add_argument("--json", default="~/aios-data/well_cards.json")
     c.add_argument("--md", default="~/aios-data/well_passport.md")
+    c.add_argument("--policy", default="",
+                   help="файл жёстких запретов для rolling_horizon "
+                        "(по умолчанию не пишется)")
 
     a = p.parse_args()
     if a.cmd == "extract":
