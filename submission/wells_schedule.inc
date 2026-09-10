@@ -70,13 +70,9 @@ DATES
 DATES
  01 'JAN' 2015 /
 /
--- 24: нарастить
+-- 24: 200 -> 450 (x2.25)
 WCONINJE
- '24' 'WATER' 'OPEN' 'RATE' 300 1* 300 1* 1* /
-/
--- 32: придушить
-WCONINJE
- '32' 'WATER' 'OPEN' 'RATE' 175 1* 300 1* 1* /
+ '24' 'WATER' 'OPEN' 'RATE' 450 1* 300 1* 1* /
 /
 DATES
  01 'FEB' 2015 /
@@ -86,6 +82,10 @@ DATES
 /
 DATES
  01 'APR' 2015 /
+/
+-- 4: 200 -> 600 (x3.0)
+WCONINJE
+ '4' 'WATER' 'OPEN' 'RATE' 600 1* 300 1* 1* /
 /
 DATES
  01 'MAY' 2015 /
