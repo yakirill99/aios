@@ -1,0 +1,449 @@
+{
+  "config": {
+    "base": "/home/user/aios/model/Model_Y_opm",
+    "workdir": "/home/user/aios-data/rolling",
+    "cut": "2014-01-01",
+    "end": "2015-12-01",
+    "step_months": 3,
+    "lookahead_months": 23,
+    "max_candidates": 25,
+    "n_prod": 4,
+    "n_inj": 2,
+    "levels": [
+      0.7,
+      1.25,
+      1.75,
+      2.25,
+      3
+    ],
+    "parallel": 6,
+    "use_triggers": true,
+    "llm_mode": "off"
+  },
+  "schedule": [
+    {
+      "date": "2014-01-01",
+      "well": "1",
+      "control": "LRAT",
+      "value": 150,
+      "reason": "форсирование отбора"
+    },
+    {
+      "date": "2014-01-01",
+      "well": "3",
+      "control": "LRAT",
+      "value": 150,
+      "reason": "форсирование отбора"
+    },
+    {
+      "date": "2014-01-01",
+      "well": "29",
+      "control": "LRAT",
+      "value": 150,
+      "reason": "форсирование отбора"
+    },
+    {
+      "date": "2014-01-01",
+      "well": "30",
+      "control": "LRAT",
+      "value": 150,
+      "reason": "форсирование отбора"
+    },
+    {
+      "date": "2014-01-01",
+      "well": "31",
+      "control": "LRAT",
+      "value": 150,
+      "reason": "форсирование отбора"
+    }
+  ],
+  "journal": [
+    {
+      "step": 0,
+      "date": "2014-01-01",
+      "chosen_tag": "PACK_prod_x1p5",
+      "chosen_actions": [
+        {
+          "date": "2014-01-01",
+          "well": "1",
+          "control": "LRAT",
+          "value": 150
+        },
+        {
+          "date": "2014-01-01",
+          "well": "3",
+          "control": "LRAT",
+          "value": 150
+        },
+        {
+          "date": "2014-01-01",
+          "well": "29",
+          "control": "LRAT",
+          "value": 150
+        },
+        {
+          "date": "2014-01-01",
+          "well": "30",
+          "control": "LRAT",
+          "value": 150
+        },
+        {
+          "date": "2014-01-01",
+          "well": "31",
+          "control": "LRAT",
+          "value": 150
+        }
+      ],
+      "npv_window": 1250.5,
+      "npv_noop": 1100,
+      "gain": 150.5,
+      "n_candidates": 25,
+      "duration_s": 240,
+      "diagnosis": {
+        "water_breakthrough": [
+          "12",
+          "31"
+        ],
+        "unprofitable": [],
+        "headroom": [
+          "1",
+          "3",
+          "29",
+          "30"
+        ],
+        "declining": [
+          "5",
+          "42"
+        ],
+        "idle": [
+          "41"
+        ]
+      },
+      "analyst_summary": "Форсирование отбора на 5 скважинах с запасом до предела",
+      "explanation": "Пакетное форсирование даёт максимальный прирост NPV",
+      "risk": "low"
+    },
+    {
+      "step": 1,
+      "date": "2014-04-01",
+      "chosen_tag": "PACK_full",
+      "chosen_actions": [
+        {
+          "date": "2014-04-01",
+          "well": "1",
+          "control": "LRAT",
+          "value": 180
+        },
+        {
+          "date": "2014-04-01",
+          "well": "3",
+          "control": "LRAT",
+          "value": 160
+        },
+        {
+          "date": "2014-04-01",
+          "well": "29",
+          "control": "LRAT",
+          "value": 170
+        },
+        {
+          "date": "2014-04-01",
+          "well": "30",
+          "control": "LRAT",
+          "value": 150
+        },
+        {
+          "date": "2014-04-01",
+          "well": "31",
+          "control": "LRAT",
+          "value": 155
+        }
+      ],
+      "npv_window": 1320.7,
+      "npv_noop": 1110,
+      "gain": 210.7,
+      "n_candidates": 20,
+      "duration_s": 210,
+      "diagnosis": {
+        "water_breakthrough": [
+          "12",
+          "31"
+        ],
+        "unprofitable": [],
+        "headroom": [
+          "1",
+          "3",
+          "29"
+        ],
+        "declining": [
+          "5"
+        ],
+        "idle": []
+      },
+      "analyst_summary": "Продолжаем форсирование, вода на 12 и 31",
+      "explanation": "Усиление форсирования даёт ещё +60 млн",
+      "risk": "medium"
+    },
+    {
+      "step": 2,
+      "date": "2014-07-01",
+      "chosen_tag": "noop",
+      "chosen_actions": [],
+      "npv_window": 1350.2,
+      "npv_noop": 1350.2,
+      "gain": 0,
+      "n_candidates": 15,
+      "duration_s": 180,
+      "diagnosis": {
+        "water_breakthrough": [
+          "12",
+          "31"
+        ],
+        "unprofitable": [],
+        "headroom": [],
+        "declining": [],
+        "idle": []
+      },
+      "analyst_summary": "Нет сработавших триггеров",
+      "explanation": "Ожидание эффекта от предыдущих действий",
+      "risk": "low"
+    },
+    {
+      "step": 3,
+      "date": "2014-10-01",
+      "chosen_tag": "PACK_inj_redistribute",
+      "chosen_actions": [
+        {
+          "date": "2014-10-01",
+          "well": "41",
+          "control": "RATE",
+          "value": 180
+        },
+        {
+          "date": "2014-10-01",
+          "well": "42",
+          "control": "RATE",
+          "value": 80
+        }
+      ],
+      "npv_window": 1420.8,
+      "npv_noop": 1360,
+      "gain": 60.8,
+      "n_candidates": 20,
+      "duration_s": 200,
+      "diagnosis": {
+        "water_breakthrough": [],
+        "unprofitable": [],
+        "headroom": [
+          "1",
+          "3",
+          "29"
+        ],
+        "declining": [
+          "5"
+        ],
+        "idle": []
+      },
+      "analyst_summary": "Перераспределение закачки",
+      "explanation": "Нагнетательная 41 эффективнее, чем 42",
+      "risk": "low"
+    },
+    {
+      "step": 4,
+      "date": "2015-01-01",
+      "chosen_tag": "PACK_prod_x1p5",
+      "chosen_actions": [
+        {
+          "date": "2015-01-01",
+          "well": "1",
+          "control": "LRAT",
+          "value": 200
+        },
+        {
+          "date": "2015-01-01",
+          "well": "3",
+          "control": "LRAT",
+          "value": 180
+        },
+        {
+          "date": "2015-01-01",
+          "well": "29",
+          "control": "LRAT",
+          "value": 190
+        }
+      ],
+      "npv_window": 1550.3,
+      "npv_noop": 1380,
+      "gain": 170.3,
+      "n_candidates": 22,
+      "duration_s": 230,
+      "diagnosis": {
+        "water_breakthrough": [
+          "12"
+        ],
+        "unprofitable": [],
+        "headroom": [
+          "1",
+          "3",
+          "29"
+        ],
+        "declining": [],
+        "idle": []
+      },
+      "analyst_summary": "Продолжаем форсирование",
+      "explanation": "Ещё есть запас до предела 500 м³/сут",
+      "risk": "medium"
+    },
+    {
+      "step": 5,
+      "date": "2015-04-01",
+      "chosen_tag": "noop",
+      "chosen_actions": [],
+      "npv_window": 1580.4,
+      "npv_noop": 1580.4,
+      "gain": 0,
+      "n_candidates": 18,
+      "duration_s": 190,
+      "diagnosis": {
+        "water_breakthrough": [],
+        "unprofitable": [],
+        "headroom": [],
+        "declining": [],
+        "idle": []
+      },
+      "analyst_summary": "Нет сработавших триггеров",
+      "explanation": "Все скважины в стабильном режиме",
+      "risk": "low"
+    }
+  ],
+  "wells": {
+    "1": {
+      "type": "prod",
+      "status": "active",
+      "oilRate": 150,
+      "liquidRate": 200,
+      "watercut": 65.2,
+      "lastAction": "Форсирование 01.01.2014"
+    },
+    "3": {
+      "type": "prod",
+      "status": "active",
+      "oilRate": 140,
+      "liquidRate": 180,
+      "watercut": 70.5,
+      "lastAction": "Форсирование 01.01.2014"
+    },
+    "5": {
+      "type": "prod",
+      "status": "warning",
+      "oilRate": 90,
+      "liquidRate": 150,
+      "watercut": 82.3,
+      "lastAction": "Наблюдение"
+    },
+    "12": {
+      "type": "prod",
+      "status": "warning",
+      "oilRate": 80,
+      "liquidRate": 160,
+      "watercut": 88.5,
+      "lastAction": "Прорыв воды 01.01.2014"
+    },
+    "29": {
+      "type": "prod",
+      "status": "active",
+      "oilRate": 100,
+      "liquidRate": 150,
+      "watercut": 60.8,
+      "lastAction": "Форсирование 01.01.2014"
+    },
+    "30": {
+      "type": "prod",
+      "status": "active",
+      "oilRate": 120,
+      "liquidRate": 170,
+      "watercut": 68.4,
+      "lastAction": "Форсирование 01.01.2014"
+    },
+    "31": {
+      "type": "prod",
+      "status": "warning",
+      "oilRate": 85,
+      "liquidRate": 140,
+      "watercut": 86.1,
+      "lastAction": "Прорыв воды 01.01.2014"
+    },
+    "41": {
+      "type": "inj",
+      "status": "active",
+      "oilRate": 0,
+      "liquidRate": 0,
+      "watercut": 0,
+      "lastAction": "Закачка 01.10.2014"
+    },
+    "42": {
+      "type": "inj",
+      "status": "active",
+      "oilRate": 0,
+      "liquidRate": 0,
+      "watercut": 0,
+      "lastAction": "Закачка 01.10.2014"
+    }
+  },
+  "agents": [
+    {
+      "name": "Аналитик",
+      "status": "active",
+      "description": "Анализирует состояние фонда",
+      "lastAction": "Диагностика скважин"
+    },
+    {
+      "name": "Стратег",
+      "status": "active",
+      "description": "Отбирает оптимальные решения",
+      "lastAction": "Выбрал пакет форсирования"
+    },
+    {
+      "name": "Критик",
+      "status": "active",
+      "description": "Объясняет принятые решения",
+      "lastAction": "Проверил гипотезы аналитика"
+    },
+    {
+      "name": "Оркестратор",
+      "status": "active",
+      "description": "Управляет циклом оптимизации",
+      "lastAction": "Запустил итерацию 6"
+    }
+  ],
+  "matrix": [
+    {
+      "source": "41",
+      "observed": "5",
+      "metric": "oil",
+      "peak_abs": 12.5,
+      "lag_month": 3
+    },
+    {
+      "source": "41",
+      "observed": "12",
+      "metric": "oil",
+      "peak_abs": 8.2,
+      "lag_month": 5
+    },
+    {
+      "source": "42",
+      "observed": "31",
+      "metric": "oil",
+      "peak_abs": -5.3,
+      "lag_month": 4
+    },
+    {
+      "source": "42",
+      "observed": "1",
+      "metric": "oil",
+      "peak_abs": 7.8,
+      "lag_month": 6
+    }
+  ]
+}

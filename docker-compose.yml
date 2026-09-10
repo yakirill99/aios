@@ -1,0 +1,25 @@
+# Запуск одной командой:  docker compose up --build
+#
+# Дашборд поднимается на демо-данных сразу, без ключей и без сети.
+# Каталог с прогонами подключается только на чтение — интерфейс
+# ничего в результатах расчёта не меняет.
+
+services:
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    image: aios-dashboard:latest
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      AIOS_LOG_LEVEL: "${AIOS_LOG_LEVEL:-INFO}"
+    volumes:
+      - "${AIOS_DATA_DIR:-~/aios-data}/rolling:/data/rolling:ro"
+      - "${AIOS_DATA_DIR:-~/aios-data}/probes:/data/probes:ro"
+      - ./submission:/app/submission:ro
+    restart: unless-stopped
+
+  # Прогоны идут снаружи, через scripts/*.sh с образом OPM Flow.
+  # Когда дойдёт до запуска симулятора из compose — сервис
+  # добавляется сюда, с тем же томом ~/aios-data на запись.
