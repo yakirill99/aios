@@ -145,6 +145,7 @@ class Config:
     constraints_path: str = ""          # configs/constraints.yaml
     events_path: str = ""               # файл недоступности скважин
     external_path: str = ""             # файл ограничений организаторов
+    policy_path: str = ""               # well_policy.json из паспорта
 
 
 @dataclass
@@ -335,18 +336,41 @@ def pick_targets(states: dict[str, WellState], diag: dict, step: int,
     return prods + injs
 
 
-def make_candidates(targets: list[WellState], at: date, cfg: Config
+def make_candidates(targets: list[WellState], at: date, cfg: Config,
+                    policy: dict | None = None
                     ) -> list[tuple[str, list[Action]]]:
     """
     Кандидаты шага. Одиночные воздействия плюс лучшая пара из прошлого
     опыта: форсировать добывающую и перераспределить закачку.
+
+    Политика паспорта (`--policy`) действует здесь:
+      закрыть -> вместо уровней генерируется единственный кандидат SHUT;
+      запрет_форсирования -> уровни выше единицы не генерируются вовсе,
+      остаются снижение и noop, и скважина исключается из пакетов.
+
+    Запрет реализован ВЫЧЁРКИВАНИЕМ кандидата, а не указанием агенту.
+    Агент физически не может предложить то, чего нет во входном наборе,
+    поэтому правило гидродинамика проверяемо, а не обещано в промпте.
     """
     out: list[tuple[str, list[Action]]] = [("noop", [])]
     d = at.isoformat()
+    pol = policy or {}
+    blocked: list[str] = []
 
     for st in targets:
+        if st.kind == "prod" and policy_wants_shut(pol, st.name):
+            out.append((f"{st.name}_shut",
+                        [Action(date=d, well=st.name, control="SHUT",
+                                reason=policy_reason(pol, st.name))]))
+            blocked.append(st.name)
+            continue
+        no_boost = st.kind == "prod" and policy_forbids_boost(pol, st.name)
+        if no_boost:
+            blocked.append(st.name)
         for lv in cfg.levels:
             if abs(lv - 1.0) < 1e-9:
+                continue
+            if no_boost and lv > 1.0:
                 continue
             if st.kind == "prod":
                 base = st.q_liq
@@ -362,8 +386,13 @@ def make_candidates(targets: list[WellState], at: date, cfg: Config
                        reason=f"{base:.0f} -> {new:.0f} (x{lv})")
             out.append((f"{st.name}_x{lv:g}".replace(".", "p"), [a]))
 
-    prods = [s for s in targets if s.kind == "prod"]
+    prods = [s for s in targets
+             if s.kind == "prod"
+             and not policy_forbids_boost(pol, s.name)
+             and not policy_wants_shut(pol, s.name)]
     injs = [s for s in targets if s.kind == "inj"]
+    if blocked:
+        print(f"    [политика] форсирование запрещено: {', '.join(blocked)}")
 
     # На горизонте 23 месяца форсирование отбора — главный рычаг: эффект
     # приходит сразу, тогда как закачка работает с лагом 6-10 месяцев и
@@ -635,6 +664,51 @@ def useful_degree(lags: dict[str, list[int]], well: str,
     return sum(1 for l in lags.get(well, []) if l <= months_left)
 
 
+# ==========================================================================
+# ПОЛИТИКА ПАСПОРТА
+# ==========================================================================
+def load_policy(path: str | Path | None) -> dict[str, dict]:
+    """
+    Жёсткие запреты гидродинамика. Файл делает well_passport.py по
+    configs/passport_rules.yaml: порогов и чисел здесь нет, только
+    результат применения правил к фонду.
+
+    Формат: {"1": {"запрет_форсирования": true, "закрыть": true,
+                   "правила": [...], "жёсткие": [...], "причина": "тег"}}
+
+    Файла нет — цикл работает как раньше. Это важно: политика ничего не
+    ломает по умолчанию, её включают явным аргументом.
+    """
+    if not path:
+        return {}
+    p = Path(path).expanduser()
+    if not p.exists():
+        print(f"  ВНИМАНИЕ: файл политики {p} не найден — иду без запретов")
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"  ВНИМАНИЕ: политика не прочитана ({e}) — иду без запретов")
+        return {}
+    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+
+
+def _num(x) -> int:
+    return int(x) if str(x).isdigit() else 0
+
+
+def policy_forbids_boost(policy: dict, well: str) -> bool:
+    return bool(policy.get(str(well), {}).get("запрет_форсирования"))
+
+
+def policy_wants_shut(policy: dict, well: str) -> bool:
+    return bool(policy.get(str(well), {}).get("закрыть"))
+
+
+def policy_reason(policy: dict, well: str) -> str:
+    return str(policy.get(str(well), {}).get("причина", "запрет паспорта"))
+
+
 class RollingHorizon:
     def __init__(self, cfg: Config, matrix: Path | None = None):
         self.cfg = cfg
@@ -683,6 +757,31 @@ class RollingHorizon:
             print(f"  ограничения: {self.limits.source}, "
                   f"групповых задано {len(act)}, "
                   f"недоступностей {len(self.limits.unavailable)}")
+
+        # Политика паспорта: запреты гидродинамика из passport_rules.yaml,
+        # применённые к фонду скриптом well_passport.py.
+        self.policy = load_policy(cfg.policy_path)
+        if self.policy:
+            n_prod_total = sum(1 for m in self.modes.values()
+                               if getattr(m, "kind", "") == "prod")
+            shut = [w for w in self.policy if policy_wants_shut(self.policy, w)]
+            ban = [w for w in self.policy
+                   if policy_forbids_boost(self.policy, w)]
+            print(f"  политика паспорта: {Path(cfg.policy_path).name}, "
+                  f"запрет форсирования у {len(ban)} скв., "
+                  f"на закрытие {len(shut) or 'нет'}")
+            if shut:
+                print(f"    закрыть: {', '.join(sorted(shut, key=_num))}")
+            if n_prod_total and len(ban) >= 0.5 * n_prod_total:
+                free = sorted((str(n) for n, m in self.modes.items()
+                               if getattr(m, "kind", "") == "prod"
+                               and not policy_forbids_boost(self.policy, n)),
+                              key=_num)
+                print(f"    ВНИМАНИЕ: запрет накрывает {len(ban)} из "
+                      f"{n_prod_total} добывающих. Форсирование остаётся "
+                      f"возможным только на: {', '.join(free) or 'НИ ОДНОЙ'}")
+                print("    Проверьте, что это осознанное решение: "
+                      "форсирование отбора — главный рычаг на 23 месяцах.")
 
         # Агентный слой. В режиме off все роли возвращают правиловый
         # результат, цикл считает ровно то же, что и без него.
@@ -935,7 +1034,7 @@ class RollingHorizon:
                 continue
             print(f"  рассматриваем: {', '.join(t.name for t in targets)}")
 
-            cands = make_candidates(targets, cur, self.cfg)
+            cands = make_candidates(targets, cur, self.cfg, self.policy)
             print(f"  кандидатов сгенерировано: {len(cands)}")
 
             # Отбраковка по внешним ограничениям с записью причины.
@@ -1114,6 +1213,13 @@ class RollingHorizon:
             "assumptions": SUBMISSION_ASSUMPTIONS,
             "cut": self.cfg.cut.isoformat(), "end": self.cfg.end.isoformat(),
             "levels": list(self.cfg.levels), "step_months": self.cfg.step_months,
+            "policy_path": self.cfg.policy_path,
+            "policy_shut": sorted((w for w in self.policy
+                                   if policy_wants_shut(self.policy, w)),
+                                  key=_num),
+            "policy_no_boost": sorted((w for w in self.policy
+                                       if policy_forbids_boost(self.policy, w)),
+                                      key=_num),
             "llm_mode": self.cfg.llm_mode,
             "llm_mode_effective": (self.agents.llm.mode
                                    if self.agents else "none"),
@@ -1171,6 +1277,10 @@ def main() -> None:
                    help="файл недоступности скважин (ремонты по датам)")
     p.add_argument("--external", default="",
                    help="файл ограничений организаторов (валидационный кейс)")
+    p.add_argument("--policy", default="",
+                   help="well_policy.json из well_passport.py: жёсткие "
+                        "запреты гидродинамика (закрытие, запрет "
+                        "форсирования). Без аргумента цикл идёт как раньше")
     a = p.parse_args()
 
     cfg = Config(
@@ -1186,7 +1296,8 @@ def main() -> None:
         llm_mode=a.llm,
         constraints_path=a.constraints,
         events_path=a.events,
-        external_path=a.external)
+        external_path=a.external,
+        policy_path=a.policy)
 
     rh = RollingHorizon(cfg, Path(a.matrix).expanduser() if a.matrix else None)
 
