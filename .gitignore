@@ -44,3 +44,6 @@ vendor/model/*/USER/
 
 # кэш ответов модели: без него не работает --llm replay
 !cache/llm/*.json
+
+# кэш ответов модели: без него не работает --llm replay
+!cache/llm/*.json
