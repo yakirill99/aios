@@ -239,3 +239,5 @@
    ============================================================ */
 
 body[data-live="true"] .mock-control { display: none !important; }
+
+.aios-progress.stalled { gap: 6px; }

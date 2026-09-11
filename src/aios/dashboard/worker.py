@@ -158,6 +158,7 @@ def run_job(job: dict[str, Any]) -> None:
                         jobs.append_log(run_id, f"Шаг {done} из {total} завершён")
                     last = done
 
+                jobs.heartbeat(f"{run_id}: шаг {done} из {total}")
                 current = jobs.read(run_id)
                 if current and current.get("status") == "cancelled":
                     process.terminate()
@@ -220,15 +221,19 @@ def main() -> int:
         print("Команда:", " ".join(build_command(job)))
         return 0
 
+    jobs.heartbeat("ожидание заданий")
     while True:
         job = jobs.next_queued()
         if job is not None:
+            jobs.heartbeat(f"работает над {job['run_id']}")
             run_job(job)
+            jobs.heartbeat("ожидание заданий")
         elif args.once:
             log.info("Очередь пуста")
             return 0
         if args.once:
             return 0
+        jobs.heartbeat("ожидание заданий")
         time.sleep(POLL_SECONDS)
 
 

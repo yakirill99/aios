@@ -63,6 +63,7 @@ async def health() -> dict[str, object]:
         "live_run": state.has_live_run(),
         "queue_writable": queue_ok,
         "queue_note": queue_note,
+        "worker_alive": jobs.worker_alive()["alive"],
         **state.describe(),
     }
 
@@ -76,6 +77,7 @@ async def meta() -> dict[str, object]:
         "queue_dir": str(jobs.QUEUE_DIR),
         "queue_writable": queue_ok,
         "queue_note": queue_note,
+        "worker": jobs.worker_alive(),
         "decks_configured": len(config.decks()),
         "presets_configured": len(config.presets()),
         **state.describe(),
@@ -186,6 +188,7 @@ async def run_status() -> dict[str, object]:
     """Текущее задание и несколько последних."""
     return {
         "readonly": READONLY,
+        "worker": jobs.worker_alive(),
         "active": jobs.active(),
         "recent": jobs.listing(10),
     }

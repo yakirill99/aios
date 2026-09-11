@@ -364,6 +364,18 @@
             box.hidden = true;
             return;
         }
+
+        // Очередь без воркера — не "сейчас начнётся", а "не начнётся"
+        if (job.status === 'queued' && meta.worker && !meta.worker.alive) {
+            box.hidden = false;
+            box.innerHTML = '';
+            box.className = 'aios-progress stalled';
+            box.appendChild(el('span', { class: 'aios-badge fail' }, 'Воркер не запущен'));
+            box.title = 'Задание в очереди, но запускать его некому. ' +
+                        'Откройте меню запуска — там команда.';
+            return;
+        }
+        box.className = 'aios-progress';
         const done = job.steps_done || 0;
         const total = job.steps_total || 0;
         const pct = total ? Math.round(done / total * 100) : 0;
@@ -387,6 +399,7 @@
     async function watchRun() {
         try {
             const data = await fetch('/api/run/status', { cache: 'no-store' }).then(r => r.json());
+            if (data.worker) meta.worker = data.worker;
             const job = data.active || null;
             renderTopProgress(job);
 
@@ -415,6 +428,8 @@
         } catch (e) {
             return;
         }
+
+        renderWorkerNotice(data.worker, data.active);
 
         const job = data.active || (data.recent || [])[0];
         if (!job) {
@@ -464,6 +479,26 @@
 
         box.appendChild(card);
         document.getElementById('aiosRunSubmit').disabled = isActive;
+    }
+
+    /** Задание висит в очереди, а брать его некому — это надо сказать прямо. */
+    function renderWorkerNotice(worker, active) {
+        const old = document.getElementById('aiosWorkerNotice');
+        if (old) old.remove();
+        if (!worker || worker.alive) return;
+        if (!active || active.status !== 'queued') return;
+
+        const box = el('div', { class: 'aios-warn', id: 'aiosWorkerNotice' });
+        box.appendChild(el('div', {},
+            'Задание поставлено, но воркер не запущен — расчёт не начнётся.'));
+        box.appendChild(el('div', { style: 'margin-top:8px;opacity:.85' },
+            'Запустите в отдельном терминале и не закрывайте его:'));
+        const cmd = el('code', {
+            style: 'display:block;margin-top:6px;padding:8px;background:#0b1220;' +
+                   'border-radius:6px;color:#7dd3fc;font-size:0.78rem;user-select:all',
+        }, 'cd ~/aios && ./scripts/dashboard_worker.sh');
+        box.appendChild(cmd);
+        document.getElementById('aiosJobBox').before(box);
     }
 
     async function cancelRun(runId) {

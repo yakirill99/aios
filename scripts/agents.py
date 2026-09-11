@@ -418,9 +418,19 @@ class AgentLayer:
         res = res or fallback
         res.explanation = scrub(res.explanation)
         res.watch = scrub(res.watch)
+
+        # Объяснение с несовершёнными действиями отбрасывается целиком:
+        # сухая формулировка правил лучше правдоподобного вымысла.
+        kept = check_claims(res.explanation, best_tag,
+                            getattr(self, "_last_actions", None))
+        rejected_claim = not kept
+        if rejected_claim:
+            res.explanation = fallback.explanation
+
         self._trace("critic", {"step": step, "best": best_tag,
                                "gain": gain_mln, "risk": res.risk,
-                               "explanation": res.explanation})
+                               "explanation": res.explanation,
+                               "rejected_claim": rejected_claim})
         return res
 
 
@@ -627,6 +637,50 @@ def _self_test() -> int:
     print("АГЕНТНЫЙ СЛОЙ РАБОТАЕТ (числа в расчёт не попадают)")
     return 0
 
+
+
+
+# --- фильтр объяснений критика ---
+# Критик объяснял шаг словами про «своевременное закрытие скважин», хотя
+# ничего не закрывалось. На расчёт это не влияет — роль объяснительная, —
+# но такой текст уходит в отчёт и на дашборд.
+#
+# Проверка стоит ПОСЛЕ ответа, рядом со scrub(), который уже вычищает
+# выдуманные числа. Промпт не меняется намеренно: его текст входит в ключ
+# кэша, и правка обесценила бы cache/llm, на котором держится replay.
+_ACTION_CLAIMS = {
+    "shut": ("закрыт", "закрыв", "закрыл", "закрытие", "закрытия",
+             "останов", "отключ", "вывед из эксплуатации"),
+    "cut": ("снижени", "снизил", "придуш", "сократил отбор"),
+    "inj": ("перевод под закачку", "переведен под закачку"),
+}
+
+
+def check_claims(text: str, best_tag: str, actions=None) -> str:
+    """
+    Пусто, если объяснение приписывает решению действия, которых в нём
+    нет. Что было сделано, определяется тегом варианта и фактическими
+    воздействиями, а не текстом модели.
+    """
+    if not text:
+        return text
+    tag = (best_tag or "").lower()
+    low = text.lower()
+
+    controls = {str(getattr(a, "control", "")).upper() for a in (actions or [])}
+    has_shut = "shut" in tag or "SHUT" in controls
+    has_cut = "x0" in tag
+    has_inj = "inj" in tag or "RATE" in controls
+
+    bad = []
+    if not has_shut:
+        bad += [w for w in _ACTION_CLAIMS["shut"] if w in low]
+    if not (has_cut or has_shut):
+        bad += [w for w in _ACTION_CLAIMS["cut"] if w in low]
+    if not has_inj:
+        bad += [w for w in _ACTION_CLAIMS["inj"] if w in low]
+
+    return "" if bad else text
 
 if __name__ == "__main__":
     import sys
