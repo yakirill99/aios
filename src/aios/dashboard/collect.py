@@ -56,7 +56,7 @@ def read_matrix() -> list[dict[str, Any]]:
         return []
 
     rows: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8", newline="") as f:
+    with path.open(encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
             try:
                 rows.append({

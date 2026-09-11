@@ -93,6 +93,8 @@ def listing(limit: int = 20) -> list[dict[str, Any]]:
         return []
     jobs = []
     for path in QUEUE_DIR.glob("*.json"):
+        if path.name == HEARTBEAT:
+            continue
         try:
             with path.open(encoding="utf-8") as f:
                 jobs.append(json.load(f))
@@ -158,6 +160,56 @@ def cancel(run_id: str) -> dict[str, Any] | None:
     if job is None or job.get("status") not in ACTIVE:
         return None
     return update(run_id, status="cancelled", detail="Отменено из интерфейса")
+
+
+# ---------------------------------------------------------------------------
+# Признак живого воркера
+# ---------------------------------------------------------------------------
+# Дашборд только кладёт задание в очередь. Если воркер никто не запустил,
+# задание будет лежать в статусе "queued" вечно, и по интерфейсу это было
+# неотличимо от "сейчас начнётся". Поэтому воркер отмечается в файле, а
+# дашборд показывает, есть ли кому взять задание.
+
+HEARTBEAT = ".worker.json"
+HEARTBEAT_TTL = 30  # секунд: воркер отмечается чаще, чем раз в 30 с
+
+
+def heartbeat(detail: str = "") -> None:
+    """Воркер отмечается, что он жив. Вызывается из его цикла."""
+    try:
+        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+        path = QUEUE_DIR / HEARTBEAT
+        tmp = path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump({"time": now(), "pid": os.getpid(), "detail": detail}, f)
+        tmp.replace(path)
+    except OSError as exc:
+        log.debug("Не удалось отметиться в очереди: %s", exc)
+
+
+def worker_alive() -> dict[str, Any]:
+    """Жив ли воркер. Возвращает {alive, last_seen, detail}."""
+    try:
+        with (QUEUE_DIR / HEARTBEAT).open(encoding="utf-8") as f:
+            beat = json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {"alive": False, "last_seen": None,
+                "detail": "Воркер ни разу не отмечался"}
+
+    try:
+        seen = datetime.fromisoformat(beat["time"])
+    except (KeyError, ValueError):
+        return {"alive": False, "last_seen": None, "detail": "Отметка повреждена"}
+
+    age = (datetime.now(timezone.utc) - seen).total_seconds()
+    alive = age < HEARTBEAT_TTL
+    return {
+        "alive": alive,
+        "last_seen": beat.get("time"),
+        "age_seconds": round(age),
+        "detail": beat.get("detail", "") if alive
+                  else f"Последняя отметка {round(age)} с назад",
+    }
 
 
 def next_queued() -> dict[str, Any] | None:
