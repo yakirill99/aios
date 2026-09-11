@@ -13,7 +13,9 @@ ENV PYTHONUNBUFFERED=1 \
     AIOS_DEMO_DIR=/app/ui/demo \
     AIOS_LIVE_DIR=/data/rolling \
     AIOS_PROBES_DIR=/data/probes \
-    AIOS_SUBMISSION_DIR=/app/submission
+    AIOS_SUBMISSION_DIR=/app/submission \
+    AIOS_CONFIG_DIR=/app/configs \
+    AIOS_QUEUE_DIR=/data/queue
 
 WORKDIR /app
 
@@ -27,6 +29,7 @@ RUN mkdir -p src/aios/dashboard \
 # ---- Только код дашборда: остальное из src/aios сюда не едет ----
 COPY src/aios/dashboard/ ./src/aios/dashboard/
 COPY ui/ ./ui/
+COPY configs/ ./configs/
 
 # Слой выше положил в site-packages пустую заглушку пакета — она была
 # нужна только чтобы закешировать установку зависимостей. Переставляем
@@ -34,7 +37,7 @@ COPY ui/ ./ui/
 # пересобираются и кеш слоя выше не пропадает.
 RUN pip install --no-cache-dir --no-deps --force-reinstall .
 
-RUN mkdir -p /data/rolling /data/probes /app/submission \
+RUN mkdir -p /data/rolling /data/probes /data/queue /app/submission \
  && useradd --create-home appuser \
  && chown -R appuser:appuser /app /data
 USER appuser

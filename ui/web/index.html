@@ -509,19 +509,18 @@
             }
         }
     </style>
+    <link rel="stylesheet" href="common.css">
+    <script src="common.js" defer></script>
 </head>
 <body>
 
 <div class="dashboard">
 
-    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:20px;">
+    <div class="mode-switch-row" style="margin-bottom:20px;">
         <div class="mode-switch" role="group" aria-label="Режим отображения">
             <button type="button" data-mode="simple"   onclick="setViewMode('simple')">Простой</button>
             <button type="button" data-mode="advanced" onclick="setViewMode('advanced')">Продвинутый</button>
         </div>
-        <span id="connBadge" class="conn-badge">Подключение…</span>
-        <span style="flex:1"></span>
-        <a href="/dashboard.html" style="color:#7dd3fc;font-size:0.9rem;text-decoration:none;">Журнал прогона →</a>
     </div>
 
     
@@ -535,8 +534,8 @@
             <p class="update-time">📅 <span id="updateTime">загрузка...</span></p>
         </div>
         <div class="header-controls">
-            <button class="btn btn-green" onclick="simulateOptimization()">▶️ Запустить оптимизацию</button>
-            <button class="btn btn-blue" onclick="resetSimulation()">🔄 Сброс</button>
+            <button class="mock-control btn btn-green" onclick="simulateOptimization()">▶️ Запустить оптимизацию</button>
+            <button class="mock-control btn btn-blue" onclick="resetSimulation()">🔄 Сброс</button>
             <button class="btn btn-outline" onclick="toggleAutoUpdate()" id="autoToggle">⏸️ Авто-обновление</button>
             <span class="status-badge success" id="systemStatus">✅ Система активна</span>
         </div>
@@ -562,10 +561,10 @@
                 Планка: <span id="baselineDisplay">1,023.4</span> млн руб.
             </div>
             <div style="margin-top: 6px; display: flex; gap: 8px; flex-wrap: wrap;">
-                <button class="btn btn-sm btn-green" onclick="addNPV(10)">+10 млн</button>
-                <button class="btn btn-sm btn-green" onclick="addNPV(50)">+50 млн</button>
-                <button class="btn btn-sm btn-red" onclick="addNPV(-10)">-10 млн</button>
-                <button class="btn btn-sm btn-yellow" onclick="randomNPV()">🎲 Случайно</button>
+                <button class="mock-control btn btn-sm btn-green" onclick="addNPV(10)">+10 млн</button>
+                <button class="mock-control btn btn-sm btn-green" onclick="addNPV(50)">+50 млн</button>
+                <button class="mock-control btn btn-sm btn-red" onclick="addNPV(-10)">-10 млн</button>
+                <button class="mock-control btn btn-sm btn-yellow" onclick="randomNPV()">🎲 Случайно</button>
             </div>
         </div>
 
@@ -584,8 +583,8 @@
                 🗓️ Горизонт: 01.01.2014 → 01.12.2015 (23 мес.)
             </div>
             <div style="margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap;">
-                <button class="btn btn-sm btn-blue" onclick="toggleWell('producer')">🔀 Переключить добывающую</button>
-                <button class="btn btn-sm btn-purple" onclick="toggleWell('injector')">🔀 Переключить нагнетательную</button>
+                <button class="mock-control btn btn-sm btn-blue" onclick="toggleWell('producer')">🔀 Переключить добывающую</button>
+                <button class="mock-control btn btn-sm btn-purple" onclick="toggleWell('injector')">🔀 Переключить нагнетательную</button>
             </div>
         </div>
 
@@ -605,13 +604,13 @@
                 <span class="status-badge warning" id="criticStatus">Ожидание</span>
             </div>
             <div style="margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap;">
-                <button class="btn btn-sm btn-outline" onclick="cycleAgentStatus('analyst')">🔄 Аналитик</button>
-                <button class="btn btn-sm btn-outline" onclick="cycleAgentStatus('strategist')">🔄 Стратег</button>
-                <button class="btn btn-sm btn-outline" onclick="cycleAgentStatus('critic')">🔄 Критик</button>
+                <button class="mock-control btn btn-sm btn-outline" onclick="cycleAgentStatus('analyst')">🔄 Аналитик</button>
+                <button class="mock-control btn btn-sm btn-outline" onclick="cycleAgentStatus('strategist')">🔄 Стратег</button>
+                <button class="mock-control btn btn-sm btn-outline" onclick="cycleAgentStatus('critic')">🔄 Критик</button>
             </div>
             <div style="margin-top: 6px; font-size: 12px; color: #64748b;">
                 🧠 LLM: <span class="positive" id="llmMode">Live</span>
-                <button class="btn btn-sm btn-outline" onclick="toggleLLM()" style="margin-left: 8px; font-size: 10px;">Сменить</button>
+                <button class="mock-control btn btn-sm btn-outline" onclick="toggleLLM()" style="margin-left: 8px; font-size: 10px;">Сменить</button>
             </div>
         </div>
     </div>
@@ -714,7 +713,7 @@
                 <button class="btn btn-sm btn-blue" onclick="filterWells('all')">Все</button>
                 <button class="btn btn-sm btn-green" onclick="filterWells('producer')">Добывающие</button>
                 <button class="btn btn-sm btn-purple" onclick="filterWells('injector')">Нагнетательные</button>
-                <button class="btn btn-sm btn-outline" onclick="toggleAllWells()">🔀 Вкл/Выкл все</button>
+                <button class="mock-control btn btn-sm btn-outline" onclick="toggleAllWells()">🔀 Вкл/Выкл все</button>
                 <span style="font-size: 12px; color: #64748b; margin-left: auto;">Шаг: 3 мес. | Кандидатов: 25</span>
             </div>
             <div class="table-wrap">
@@ -733,7 +732,7 @@
             <div style="font-size: 12px; color: #64748b; margin-bottom: 8px; display: flex; gap: 12px; flex-wrap: wrap;">
                 <span>📁 Совместим с гидродинамической моделью</span>
                 <span class="status-badge success" id="scheduleStatus">✅ Корректен</span>
-                <button class="btn btn-sm btn-outline" onclick="refreshSchedule()">🔄 Обновить</button>
+                <button class="mock-control btn btn-sm btn-outline" onclick="refreshSchedule()">🔄 Обновить</button>
             </div>
             <div class="code-block" id="scheduleContent">
                 <span class="comment">-- wells_schedule.inc</span>
@@ -782,7 +781,7 @@
                 
                 <div style="color: #94a3b8;">Кандидатов:</div>
                 <div><strong id="candidateCount">25</strong>
-                    <button class="btn btn-sm btn-outline" onclick="changeCandidates()" style="margin-left: 4px; font-size: 10px;">✏️</button>
+                    <button class="mock-control btn btn-sm btn-outline" onclick="changeCandidates()" style="margin-left: 4px; font-size: 10px;">✏️</button>
                 </div>
                 
                 <div style="color: #94a3b8;">Уровни множителей:</div>
@@ -804,9 +803,9 @@
                 </div>
             </div>
             <div style="margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap;">
-                <button class="btn btn-sm btn-blue" onclick="increaseProgress()">⏫ +5%</button>
-                <button class="btn btn-sm btn-yellow" onclick="randomProgress()">🎲 Случайно</button>
-                <button class="btn btn-sm btn-outline" onclick="resetProgress()">↺ Сброс</button>
+                <button class="mock-control btn btn-sm btn-blue" onclick="increaseProgress()">⏫ +5%</button>
+                <button class="mock-control btn btn-sm btn-yellow" onclick="randomProgress()">🎲 Случайно</button>
+                <button class="mock-control btn btn-sm btn-outline" onclick="resetProgress()">↺ Сброс</button>
             </div>
         </div>
 
@@ -814,7 +813,7 @@
         <div class="card advanced-only animate-in" style="animation-delay: 1.3s;">
             <h3>📝 Лог оптимизации <span class="badge" id="logCount">0 событий</span></h3>
             <div style="display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap;">
-                <button class="btn btn-sm btn-green" onclick="addRandomLog()">➕ Добавить событие</button>
+                <button class="mock-control btn btn-sm btn-green" onclick="addRandomLog()">➕ Добавить событие</button>
                 <button class="btn btn-sm btn-red" onclick="clearLogs()">🗑️ Очистить</button>
                 <button class="btn btn-sm btn-outline" onclick="toggleLogAuto()" id="logAutoToggle">⏸️ Авто</button>
             </div>
