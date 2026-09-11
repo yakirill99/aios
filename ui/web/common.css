@@ -1,0 +1,241 @@
+/* ============================================================
+   Общая шапка, индикатор источника данных и меню запуска.
+   Подключается обеими страницами. Цвета подобраны так, чтобы
+   ложиться и на тёмно-синий фон сводки, и на графитовый фон
+   журнала — поэтому здесь нейтральная палитра, а не палитра
+   конкретной страницы.
+   ============================================================ */
+
+.aios-topbar {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 10px 20px;
+    margin-bottom: 20px;
+    background: rgba(15, 20, 32, 0.92);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid #2a3444;
+    font-family: inherit;
+}
+
+.aios-nav { display: flex; gap: 4px; }
+
+.aios-nav a {
+    color: #94a3b8;
+    text-decoration: none;
+    padding: 7px 14px;
+    border-radius: 7px;
+    font-size: 0.9rem;
+    transition: background 0.15s, color 0.15s;
+}
+.aios-nav a:hover { background: #1e293b; color: #e2e8f0; }
+.aios-nav a.active { background: #334155; color: #f1f5f9; }
+.aios-nav a:focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
+
+.aios-spacer { flex: 1; }
+
+/* --- индикаторы --- */
+
+.aios-badge {
+    font-size: 0.78rem;
+    padding: 5px 11px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    white-space: nowrap;
+    cursor: default;
+}
+.aios-badge.live    { color: #4ade80; border-color: #14532d; background: #052e16; }
+.aios-badge.demo    { color: #94a3b8; border-color: #334155; background: #1e293b; }
+.aios-badge.mixed   { color: #fbbf24; border-color: #78350f; background: #291502; }
+.aios-badge.ok      { color: #4ade80; border-color: #14532d; background: #052e16; }
+.aios-badge.fail    { color: #fbbf24; border-color: #78350f; background: #291502; }
+.aios-badge.unknown { color: #64748b; border-color: #334155; background: #1e293b; }
+
+/* --- кнопки --- */
+
+.aios-btn {
+    background: #1d4ed8;
+    color: #fff;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 0.88rem;
+    font-family: inherit;
+    transition: background 0.15s;
+}
+.aios-btn:hover:not(:disabled) { background: #2563eb; }
+.aios-btn:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+.aios-btn:focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
+.aios-btn.secondary { background: #334155; }
+.aios-btn.secondary:hover:not(:disabled) { background: #475569; }
+.aios-btn.danger { background: #7f1d1d; }
+.aios-btn.danger:hover:not(:disabled) { background: #991b1b; }
+
+/* --- модальное окно запуска --- */
+
+.aios-modal-back {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: rgba(2, 6, 16, 0.75);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 40px 16px;
+    overflow-y: auto;
+}
+.aios-modal-back[hidden] { display: none; }
+
+.aios-modal {
+    width: min(640px, 100%);
+    background: #111827;
+    border: 1px solid #334155;
+    border-radius: 14px;
+    padding: 24px;
+    color: #e2e8f0;
+    font-size: 0.92rem;
+}
+.aios-modal h2 { margin: 0 0 4px; font-size: 1.15rem; color: #f1f5f9; }
+.aios-modal .aios-sub { color: #94a3b8; font-size: 0.85rem; margin-bottom: 20px; }
+
+.aios-field { margin-bottom: 18px; }
+.aios-field > label {
+    display: block;
+    margin-bottom: 6px;
+    color: #cbd5e1;
+    font-size: 0.85rem;
+}
+.aios-field select,
+.aios-field input[type="number"] {
+    width: 100%;
+    background: #0b1220;
+    border: 1px solid #334155;
+    color: #e2e8f0;
+    border-radius: 8px;
+    padding: 9px 11px;
+    font-size: 0.9rem;
+    font-family: inherit;
+}
+.aios-field select:focus,
+.aios-field input:focus { outline: 2px solid #38bdf8; outline-offset: -1px; }
+.aios-help { color: #64748b; font-size: 0.78rem; margin-top: 5px; }
+
+.aios-warn {
+    background: #291502;
+    border: 1px solid #78350f;
+    color: #fbbf24;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 0.82rem;
+    margin-bottom: 16px;
+}
+.aios-error {
+    background: #2a0a0a;
+    border: 1px solid #7f1d1d;
+    color: #fca5a5;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 0.82rem;
+    margin-bottom: 16px;
+}
+.aios-error[hidden], .aios-warn[hidden] { display: none; }
+
+.aios-actions {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    margin-top: 22px;
+    padding-top: 18px;
+    border-top: 1px solid #1f2937;
+}
+
+/* --- состояние текущего задания --- */
+
+.aios-job {
+    background: #0b1220;
+    border: 1px solid #1f2937;
+    border-radius: 10px;
+    padding: 14px;
+    margin-bottom: 18px;
+    font-size: 0.85rem;
+}
+.aios-job-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+.aios-job code { color: #7dd3fc; font-size: 0.8rem; }
+.aios-job-log {
+    max-height: 160px;
+    overflow-y: auto;
+    color: #94a3b8;
+    font-size: 0.78rem;
+    line-height: 1.6;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .aios-topbar, .aios-btn, .aios-nav a { transition: none; }
+}
+
+/* ============================================================
+   ПРОГРЕСС ПРОГОНА
+   ============================================================ */
+
+.aios-progress {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 0.8rem;
+    color: #cbd5e1;
+    white-space: nowrap;
+}
+.aios-progress[hidden] { display: none; }
+
+.aios-progress-track {
+    display: inline-block;
+    width: 90px;
+    height: 5px;
+    background: #1e293b;
+    border-radius: 999px;
+    overflow: hidden;
+}
+.aios-progress-track.wide { display: block; width: 100%; height: 7px; margin: 6px 0 4px; }
+.aios-progress-fill {
+    display: block;
+    height: 100%;
+    background: #38bdf8;
+    border-radius: 999px;
+    transition: width 0.4s ease;
+}
+
+.aios-spin {
+    width: 11px; height: 11px;
+    border: 2px solid #334155;
+    border-top-color: #38bdf8;
+    border-radius: 50%;
+    display: inline-block;
+    animation: aios-spin 0.9s linear infinite;
+}
+@keyframes aios-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+    .aios-spin { animation: none; border-top-color: #38bdf8; }
+    .aios-progress-fill { transition: none; }
+}
+
+/* ============================================================
+   КНОПКИ-МОКАПЫ
+   Подменяют цифры на экране. Пока данные эталонные — это
+   демонстрация и они полезны. Как только пришли данные прогона,
+   прятать обязательно: иначе на защите можно нарисовать любой NPV,
+   а опрос через две секунды вернёт настоящий.
+   ============================================================ */
+
+body[data-live="true"] .mock-control { display: none !important; }

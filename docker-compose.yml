@@ -1,8 +1,8 @@
 # Запуск одной командой:  docker compose up --build
 #
-# Дашборд поднимается на демо-данных сразу, без ключей и без сети.
-# Каталог с прогонами подключается только на чтение — интерфейс
-# ничего в результатах расчёта не меняет.
+# Дашборд поднимается на эталонных данных сразу, без ключей и без сети.
+# Результаты прогонов подключены только на чтение — интерфейс ничего в
+# них не меняет. На запись открыт единственный каталог: очередь заданий.
 
 services:
   dashboard:
@@ -14,12 +14,37 @@ services:
       - "${PORT:-8000}:8000"
     environment:
       AIOS_LOG_LEVEL: "${AIOS_LOG_LEVEL:-INFO}"
+      # 1 — меню запуска пропадает, ручки запуска отвечают отказом.
+      # Так собирается сборка для организаторов.
+      AIOS_READONLY: "${AIOS_READONLY:-0}"
     volumes:
       - "${AIOS_DATA_DIR:-~/aios-data}/rolling:/data/rolling:ro"
       - "${AIOS_DATA_DIR:-~/aios-data}/probes:/data/probes:ro"
+      - "${AIOS_DATA_DIR:-~/aios-data}/queue:/data/queue"
+      - ./configs:/app/configs:ro
       - ./submission:/app/submission:ro
     restart: unless-stopped
 
-  # Прогоны идут снаружи, через scripts/*.sh с образом OPM Flow.
-  # Когда дойдёт до запуска симулятора из compose — сервис
-  # добавляется сюда, с тем же томом ~/aios-data на запись.
+  # Воркер очереди. Запускает симулятор, поэтому собирается из образа
+  # с OPM Flow, а не из образа дашборда. Профиль worker: по умолчанию
+  # не поднимается, чтобы `docker compose up` у организаторов не тянул
+  # тяжёлый образ.
+  #
+  #   docker compose --profile worker up -d worker
+  #
+  # worker:
+  #   profiles: ["worker"]
+  #   build:
+  #     context: .
+  #     dockerfile: scripts/Dockerfile
+  #   command: python -m aios.dashboard.worker
+  #   environment:
+  #     AIOS_RUN_CMD: "${AIOS_RUN_CMD:-}"
+  #     AIOS_QUEUE_DIR: /data/queue
+  #     AIOS_DATA_DIR: /data
+  #     AIOS_LIVE_DIR: /data/rolling
+  #     AIOS_CONFIG_DIR: /app/configs
+  #   volumes:
+  #     - "${AIOS_DATA_DIR:-~/aios-data}:/data"
+  #     - ./configs:/app/configs
+  #     - ./src:/app/src

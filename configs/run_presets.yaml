@@ -1,0 +1,142 @@
+# Пресеты запуска и схема параметров.
+#
+# Схема `params` — одновременно описание формы на фронте и белый список
+# на бэкенде. Параметра, которого здесь нет, сервер не примет.
+#
+# Имена параметров соответствуют флагам rolling_horizon.py:
+#   cut -> --cut, step_months -> --step, candidates -> --candidates,
+#   parallel -> --parallel, llm_mode -> --llm
+# Исключение — steps: у цикла горизонт задаётся датами, поэтому воркер
+# превращает число шагов в --end = cut + steps * step_months.
+
+presets:
+  - id: replay
+    name: Проигрывание записи
+    description: >-
+      Повтор сохранённого прогона из llm_cache. Симулятор не
+      запускается, результат появляется сразу. Это режим для защиты.
+    instant: true
+    params:
+      cut: "2014-01-01"
+      steps: 6
+      step_months: 3
+      candidates: 25
+      parallel: 6
+      llm_mode: replay
+
+  - id: smoke
+    name: Проверка контура (1 шаг)
+    description: >-
+      Один шаг горизонта с малым перебором. Нужен, чтобы убедиться,
+      что связка дашборд-воркер-OPM вообще жива.
+    instant: false
+    params:
+      cut: "2014-01-01"
+      steps: 1
+      step_months: 3
+      candidates: 5
+      parallel: 6
+      llm_mode: "off"
+
+  - id: demo
+    name: Короткий прогон (2 шага)
+    description: >-
+      Настоящий расчёт на двух окнах. Порядок времени — десятки минут.
+    instant: false
+    params:
+      cut: "2014-01-01"
+      steps: 2
+      step_months: 3
+      candidates: 20
+      parallel: 6
+      llm_mode: "off"
+
+  - id: full
+    name: Полный горизонт
+    description: >-
+      Весь период 2014-2015 с агентным слоем. Часы. Рабочий режим,
+      для показа не годится.
+    instant: false
+    params:
+      cut: "2014-01-01"
+      steps: 8
+      step_months: 3
+      candidates: 25
+      parallel: 6
+      llm_mode: live
+      # без профиля режим live не проходит валидацию — он обязателен
+      llm_profile: ollama_local
+
+# Схема параметров: и форма, и валидация
+params:
+  - id: cut
+    label: Начало горизонта
+    type: date
+    help: Дата, с которой цикл начинает управлять. Флаг --cut.
+
+  - id: steps
+    label: Шагов горизонта
+    type: int
+    min: 1
+    max: 40
+    help: Число окон. Воркер пересчитает его в дату окончания (--end).
+
+  - id: step_months
+    label: Шаг управления, мес
+    type: int
+    min: 1
+    max: 12
+    help: Флаг --step. Как часто цикл вмешивается в режимы.
+
+  - id: candidates
+    label: Кандидатов на шаг
+    type: int
+    min: 1
+    max: 200
+    help: Флаг --candidates. На время влияет сильнее, чем число шагов.
+
+  - id: parallel
+    label: Параллельных прогонов
+    type: int
+    min: 1
+    max: 32
+    help: Флаг --parallel. Ограничен ядрами и оперативной памятью.
+
+  - id: llm_mode
+    label: Режим LLM
+    type: enum
+    options:
+      - value: "off"
+        label: Без LLM (правила)
+        help: Агентный слой не создаётся вовсе
+      - value: replay
+        label: Запись
+        help: Ответы из llm_cache, сеть не нужна
+      - value: live
+        label: Живой вызов
+        help: Обращение к модели из профиля ниже
+
+  - id: llm_profile
+    label: Профиль модели
+    type: enum
+    depends_on: llm_mode
+    depends_value: live
+    options:
+      - value: ollama_local
+        label: Ollama (локально)
+        help: Модель на этой машине, интернет не нужен
+      - value: ollama_qwen
+        label: Ollama / Qwen
+        help: Альтернативная модель на том же сервере
+
+# Профили LLM. Свободный ввод адреса с фронта не принимается: это
+# позволило бы заставить бэкенд сходить на произвольный хост.
+llm_profiles:
+  ollama_local:
+    provider: ollama
+    base_url: http://127.0.0.1:11434
+    model: llama3
+  ollama_qwen:
+    provider: ollama
+    base_url: http://127.0.0.1:11434
+    model: qwen2.5

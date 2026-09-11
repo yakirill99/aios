@@ -95,18 +95,60 @@ def build_wells(journal: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return wells
 
 
-def build_agents(journal: dict[str, Any]) -> list[dict[str, Any]]:
-    """Карточки агентов. В журнале их состояния нет — берём из последнего шага."""
+def read_result() -> dict[str, Any]:
+    """result.json цикла: там лежит правда про агентный слой.
+
+    Ключи llm_mode / llm_mode_effective / llm_steps / rule_steps пишет
+    сам rolling_horizon.py. Именно по ним видно, работали агенты или
+    цикл весь прогон шёл на эвристиках.
+    """
+    path = LIVE_DIR / "result.json"
+    try:
+        with path.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def build_agents(journal: dict[str, Any], result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Карточки агентов по фактическим данным прогона.
+
+    Раньше здесь стояли выдуманные статусы: карточки «работали» всегда,
+    даже когда цикл шёл с --llm off и агентного слоя не существовало.
+    На защите это прямой повод для неудобного вопроса.
+    """
     steps = journal.get("journal", [])
     last = steps[-1] if steps else {}
-    done = "active" if steps else "idle"
+
+    requested = result.get("llm_mode") or journal.get("config", {}).get("llm_mode", "off")
+    effective = result.get("llm_mode_effective", "none")
+    llm_steps = int(result.get("llm_steps", 0) or 0)
+    rule_steps = int(result.get("rule_steps", 0) or 0)
+
+    if requested == "off":
+        status, note = "idle", "Не использовался: прогон шёл на правилах (--llm off)"
+    elif llm_steps == 0:
+        status, note = "idle", f"Запрошен режим {requested}, но ни один шаг его не задействовал"
+    else:
+        status = "active"
+        note = f"Шагов с агентом: {llm_steps}, на правилах: {rule_steps}"
+        if effective and effective != requested:
+            note += f". ВНИМАНИЕ: запрошен {requested}, фактически {effective}"
+
+    def card(name: str, description: str, action: str) -> dict[str, Any]:
+        return {"name": name, "status": status, "description": description,
+                "lastAction": action if status == "active" else note}
+
     return [
-        {"name": "Аналитик", "status": done, "description": "Анализирует состояние фонда",
-         "lastAction": last.get("analyst_summary", "—")},
-        {"name": "Стратег", "status": done, "description": "Отбирает оптимальные решения",
-         "lastAction": last.get("chosen_tag", "—")},
-        {"name": "Критик", "status": done, "description": "Проверяет ограничения",
-         "lastAction": f"риск: {last.get('risk', '—')}"},
+        card("Аналитик", "Анализирует состояние фонда",
+             last.get("analyst_summary") or "—"),
+        card("Стратег", "Отбирает оптимальные решения",
+             last.get("chosen_tag") or "—"),
+        card("Критик", "Объясняет принятые решения",
+             last.get("explanation") or last.get("risk") or "—"),
+        {"name": "Оркестратор", "status": "active" if steps else "idle",
+         "description": "Управляет циклом оптимизации",
+         "lastAction": f"Шагов выполнено: {len(steps)}" if steps else "Прогонов не было"},
     ]
 
 
@@ -114,16 +156,27 @@ def build_agents(journal: dict[str, Any]) -> list[dict[str, Any]]:
 # Сводка для главного экрана
 # ---------------------------------------------------------------------------
 
-def build_state(journal: dict[str, Any]) -> dict[str, Any]:
+def build_state(journal: dict[str, Any], result: dict[str, Any] | None = None) -> dict[str, Any]:
     """Сводит журнал в короткое состояние.
 
     Ничего не пересчитывает — только агрегирует то, что уже посчитал
     расчёт, чтобы цифры на двух экранах не разъехались.
     """
+    result = result or {}
     steps = journal.get("journal", [])
     last = steps[-1] if steps else {}
     wells = journal.get("wells", {})
     config = journal.get("config", {})
+
+    # Статусы агентов берём из тех же карточек, что видит журнал —
+    # два экрана не должны расходиться.
+    cards = {c["name"]: c for c in journal.get("agents", [])}
+
+    def agent_state(name: str) -> str:
+        card = cards.get(name)
+        if card is None:
+            return "—"
+        return "Активен" if card.get("status") == "active" else "Не задействован"
 
     rows = []
     for well_id, w in wells.items():
@@ -157,11 +210,15 @@ def build_state(journal: dict[str, Any]) -> dict[str, Any]:
         "wellsTotal": len(rows),
         "progress": _progress(config, steps),
         "candidates": last.get("n_candidates", config.get("max_candidates", 0)),
-        "llmMode": config.get("llm_mode", "off"),
+        "llmMode": result.get("llm_mode_effective") or config.get("llm_mode", "off"),
         "autoUpdate": True,
         "logAuto": True,
         "logCount": len(logs),
-        "agents": {"analyst": "Завершён", "strategist": "Завершён", "critic": "Завершён"},
+        "agents": {
+            "analyst": agent_state("Аналитик"),
+            "strategist": agent_state("Стратег"),
+            "critic": agent_state("Критик"),
+        },
         "wells": rows,
         "logs": logs,
     }
@@ -204,12 +261,16 @@ def main() -> int:
         print(f"ошибка: {exc}")
         return 1
 
+    result = read_result()
     journal.setdefault("wells", build_wells(journal))
-    journal.setdefault("agents", build_agents(journal))
+    journal["agents"] = build_agents(journal, result)
     journal.setdefault("matrix", read_matrix())
 
     write_atomic(LIVE_DIR / "journal.json", journal)
-    write_atomic(LIVE_DIR / "state.json", build_state(journal))
+    write_atomic(LIVE_DIR / "state.json", build_state(journal, result))
+
+    llm = result.get("llm_mode_effective", "нет result.json")
+    print(f"агентный слой: {llm} | шагов с агентом: {result.get('llm_steps', '?')}")
 
     steps = len(journal.get("journal", []))
     print(f"шагов: {steps} | скважин: {len(journal['wells'])} | связей: {len(journal['matrix'])}")

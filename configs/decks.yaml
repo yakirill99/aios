@@ -1,0 +1,86 @@
+# Реестр деки.
+#
+# Дашборд показывает этот список в меню запуска и разрешает прогон
+# только по идентификатору отсюда. Произвольный путь с фронта не
+# принимается: загрузка деки через веб не предусмотрена намеренно.
+#
+# Чтобы подключить новое месторождение:
+#   1. положить деку в model/<имя>/ и адаптировать под OPM Flow
+#   2. посчитать планку: scripts/prepare_baseline.sh
+#   3. описать ограничения в отдельном configs/constraints.<имя>.yaml
+#   4. добавить запись сюда
+#
+# Пункт 3 — не формальность: пороги и нормативы завязаны на конкретный
+# фонд, переносить их между месторождениями нельзя.
+
+decks:
+  - id: model_y
+    name: Model_Y
+    description: Базовое месторождение конкурса
+    path: model/Model_Y_opm
+    data_file: MODEL_Y.DATA
+    constraints: configs/constraints.yaml
+    triggers: configs/triggers.yaml
+    wells: 49
+    # Планка ЧДД из prepare_baseline.sh. null — ещё не посчитана,
+    # дашборд покажет это в меню и не станет выдумывать число.
+    baseline_npv: null
+    ready: true
+
+  - id: model_y_base
+    name: Model_Y (опорный)
+    description: Режимы заморожены, служит планкой для сравнения
+    path: model/Model_Y_base
+    data_file: MODEL_Y.DATA
+    constraints: configs/constraints.yaml
+    triggers: configs/triggers.yaml
+    wells: 49
+    baseline_npv: null
+    ready: true
+
+  # --- Публичные деки для проверки масштабируемости -----------------
+  # Реальное месторождение Statoil в Норвежском море, Open Database
+  # License. Независимая от конкурса модель: если система отработает
+  # на ней, значит она не прибита гвоздями к Model_Y.
+  #
+  # Загрузка:  ./scripts/fetch_public_deck.sh norne
+  - id: norne
+    name: Norne (публичная)
+    description: Реальное месторождение, сетка 46 x 112 x 22, из репозитория OPM
+    path: model/norne
+    data_file: NORNE_ATW2013.DATA
+    constraints: configs/constraints.norne.yaml
+    triggers: configs/triggers.yaml
+    wells: null
+    baseline_npv: null
+    # Пока не загружена и не посчитана планка — в меню серая
+    ready: false
+
+  # Маленькая синтетическая модель. Считается минуты, а не часы —
+  # именно на ней имеет смысл первый раз проверять, что смена деки
+  # вообще работает.
+  #
+  # Загрузка:  ./scripts/fetch_public_deck.sh spe9
+  - id: spe9
+    name: SPE9 (публичная, быстрая)
+    description: Синтетический тест SPE, 24 x 25 x 15, 26 скважин
+    path: model/spe9
+    data_file: SPE9.DATA
+    constraints: configs/constraints.spe9.yaml
+    triggers: configs/triggers.yaml
+    wells: 26
+    baseline_npv: null
+    ready: false
+
+  # Пример незаполненной записи: показывается в списке серым и
+  # недоступна для запуска, пока ready не станет true.
+  # - id: field_b
+  #   name: Месторождение Б
+  #   description: Пример подключения второго актива
+  #   path: model/Field_B_opm
+  #   data_file: FIELD_B.DATA
+  #   constraints: configs/constraints.field_b.yaml
+  #   triggers: configs/triggers.yaml
+  #   wells: null
+  #   baseline_npv: null
+  #   ready: false
